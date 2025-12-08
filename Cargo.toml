@@ -1,0 +1,11 @@
+[package]
+name = "firesim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+convolve2d = "0.2.0"
+fastrand = "2.3.0"
+fontdue = "0.9.3"
+minifb = "0.28.0"
+rayon = "1.11.0"
