@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use convolve2d::DynamicMatrix;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 #[derive(Clone)]
@@ -71,7 +70,7 @@ pub struct SimulationParameters {
     /// ```
     pub underbrush_tree_growth_hindrance: f32,
     /// The base rate of underbrush accumulation
-    pub underbrush_base_accumulation: f32,
+    pub tree_underbrush_generation: f32,
     /// The amount of underbrush created when a tree dies naturally
     pub tree_death_underbrush: f32,
     /// The chance (0 - 1) that a particular tree dies naturally each tick
@@ -94,6 +93,33 @@ pub struct SimulationParameters {
     pub lightning_frequency: f32,
     /// The tick rate in ticks per second
     pub tick_rate: u32,
+}
+
+impl SimulationParameters {
+    pub fn realistic(
+        width: usize,
+        height: usize,
+        ticks_per_month: f32,
+        months_per_second: f32,
+    ) -> SimulationParameters {
+        let acres = (width as f32 * height as f32) / 4047.0;
+        let tick_rate = ticks_per_month * months_per_second;
+        let tick_rate = tick_rate.round() as u32;
+        Self {
+            tick_rate,
+            lightning_frequency: 1.0 / acres / 45.0 / 12.0,
+            tree_growth_rate: 1.0 / (ticks_per_month * 12.0 * 150.0),
+            tree_death_rate: 1.0 / (ticks_per_month * 12.0 * 200.0),
+            underbrush_tree_growth_hindrance: 0.0,
+            tree_underbrush_generation: 0.0001,
+            tree_death_underbrush: 0.01,
+            tree_fire_duration: 1,
+            underbrush_fire_duration: 1,
+            fire_spread_rate: 1.0,
+            tree_flammability: 0.5,
+            underbrush_flammability: 1.0,
+        }
+    }
 }
 
 #[non_exhaustive]
@@ -178,17 +204,6 @@ fn sim_thread(
             .expect("a thread accessing the simulation parameters panicked");
         (f.width, f.height)
     };
-    #[rustfmt::skip]
-    let neighbors_kernel = DynamicMatrix::new(
-        3,
-        3,
-        vec![
-            0.125, 0.125, 0.125,
-            0.125, 0.0,   0.125,
-            0.125, 0.125, 0.125
-        ],
-    )
-    .unwrap();
     let mut end_of_last_step: Instant = Instant::now();
     let mut total_iterations = 0;
     let mut total_time = Duration::new(0, 0);
@@ -208,7 +223,7 @@ fn sim_thread(
             "build burning_neighbors":
             let burning_neighbors: Vec<_> = (0..width * height)
                 .into_par_iter()
-                .map(|i| get_burning_neighbors_of_cell(&latest_frame.grid, i, width, height))
+                .map(|i| get_neighboring_cell_info(&latest_frame.grid, i, width, height))
                 .collect();
         },
         {
@@ -224,17 +239,14 @@ fn sim_thread(
             cell_data
                 .into_par_iter()
                 .for_each(|(state, burning_neighbors)| {
-                    let s1 = fastrand::f32();
-                    let s2 = fastrand::f32();
-                    let s3 = fastrand::f32();
-                    if s3 < parameters.lightning_frequency / (width * height) as f32
+                    if fastrand::f32() < parameters.lightning_frequency / (width * height) as f32
                         && !state.burning.burning()
                     {
                         state.burning = BurnState::Burning {
                             ticks_remaining: calculate_burn_duration(state, &parameters),
                         }
                     }
-                    apply_simulation_rules(state, &parameters, burning_neighbors, s1, s2)
+                    apply_simulation_rules(state, &parameters, burning_neighbors)
                 });
         },
         {
@@ -261,9 +273,7 @@ fn sim_thread(
 fn apply_simulation_rules(
     state: &mut CellState,
     parameters: &SimulationParameters,
-    neighboring_fires: f32,
-    fire_random_seed: f32,
-    tree_random_seed: f32,
+    neighboring_cell_info: NeighboringCellInfo,
 ) {
     handle_burn(state);
     let total_flammability = if state.tree {
@@ -273,7 +283,10 @@ fn apply_simulation_rules(
     } + state.underbrush * parameters.underbrush_flammability;
     let already_burning = state.burning.burning();
     let burning = already_burning
-        || fire_random_seed < neighboring_fires * parameters.fire_spread_rate * total_flammability;
+        || fastrand::f32()
+            < (neighboring_cell_info.fires as f32 / 8.0)
+                * parameters.fire_spread_rate
+                * total_flammability;
     let new_burn_state = if already_burning || !burning {
         state.burning.clone()
     } else {
@@ -282,14 +295,17 @@ fn apply_simulation_rules(
         }
     };
 
+    let tree_dies = state.tree && fastrand::f32() < parameters.tree_death_rate;
+
     let tree = state.tree
         || !burning
-            && tree_random_seed
+            && fastrand::f32()
                 < parameters.tree_growth_rate
                     * (1.0 - parameters.underbrush_tree_growth_hindrance * state.underbrush);
 
-    let underbrush =
-        state.underbrush + (!burning) as u32 as f32 * parameters.underbrush_base_accumulation;
+    let underbrush = state.underbrush
+        + parameters.tree_underbrush_generation * (tree as u8 + neighboring_cell_info.trees) as f32
+        + parameters.tree_death_underbrush * (tree_dies as u32 as f32);
 
     state.underbrush = underbrush;
     state.tree = tree;
@@ -321,14 +337,18 @@ fn calculate_burn_duration(state: &CellState, parameters: &SimulationParameters)
         + state.tree as u32 * parameters.tree_fire_duration
 }
 
+struct NeighboringCellInfo {
+    trees: u8,
+    fires: u8,
+}
+
 #[inline(always)]
-fn get_burning_neighbors_of_cell(
+fn get_neighboring_cell_info(
     grid: &[CellState],
     idx: usize,
     width: usize,
     height: usize,
-) -> f32 {
-    // Precompute row/col
+) -> NeighboringCellInfo {
     let row = idx / width;
     let col = idx % width;
 
@@ -344,24 +364,24 @@ fn get_burning_neighbors_of_cell(
         (1, 1),
     ];
 
-    let mut count: u8 = 0;
+    let mut fires: u8 = 0;
+    let mut trees: u8 = 0;
 
-    // Manual bounds checks avoid modulo and wrapping logic.
     for (dr, dc) in N {
         let nr = row as isize + dr;
         let nc = col as isize + dc;
 
-        // Bounds check becomes two predictable comparisons.
         if nr >= 0 && nr < height as isize && nc >= 0 && nc < width as isize {
             let nidx = nr as usize * width + nc as usize;
 
-            // Burning check—typically branch-predictable.
             if grid[nidx].burning.burning() {
-                count += 1;
+                fires += 1;
+            }
+            if grid[nidx].tree {
+                trees += 1;
             }
         }
     }
 
-    // Multiply instead of adding 0.125 repeatedly.
-    (count as f32) * 0.125
+    NeighboringCellInfo { fires, trees }
 }
