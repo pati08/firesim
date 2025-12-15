@@ -3,10 +3,12 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
+use wasm_thread as thread;
+
+use arc_swap::ArcSwap;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 #[derive(Clone)]
@@ -130,38 +132,42 @@ pub struct SimulationStatistics {
 }
 
 pub struct Simulation {
-    join_handle: JoinHandle<SimulationStatistics>,
     parameters: Arc<Mutex<SimulationParameters>>,
     stop: Arc<AtomicBool>,
-    latest_frame: Arc<Mutex<SimulationFrame>>,
+    latest_frame: Arc<ArcSwap<SimulationFrame>>,
+    join_handle: thread::JoinHandle<SimulationStatistics>,
+}
+
+/// Spawn a simulation on a new thread using the provided spawner.
+pub fn spawn_simulation(
+    start_frame: SimulationFrame,
+    parameters: SimulationParameters,
+    // spawner: S,
+) -> Simulation {
+    let parameters = Arc::new(Mutex::new(parameters));
+    let stop = Arc::new(AtomicBool::new(false));
+    let latest_frame = Arc::new(start_frame);
+    let latest_frame = Arc::new(ArcSwap::from(latest_frame));
+    let p = Arc::clone(&parameters);
+    let s = Arc::clone(&stop);
+    let l = Arc::clone(&latest_frame);
+    let handle = thread::spawn(|| sim_thread(p, s, l));
+    Simulation {
+        parameters,
+        stop,
+        latest_frame,
+        join_handle: handle,
+    }
 }
 
 impl Simulation {
-    pub fn spawn(start_frame: SimulationFrame, parameters: SimulationParameters) -> Self {
-        let parameters = Arc::new(Mutex::new(parameters));
-        let stop = Arc::new(AtomicBool::new(false));
-        let latest_frame = Arc::new(Mutex::new(start_frame));
-        let p = Arc::clone(&parameters);
-        let s = Arc::clone(&stop);
-        let l = Arc::clone(&latest_frame);
-        Self {
-            join_handle: std::thread::spawn(|| sim_thread(p, s, l)),
-            parameters,
-            stop,
-            latest_frame,
-        }
-    }
-    /// Get the latest completed simulation frame. This function blocks if a
-    /// simulation step is in progress
+    /// Get the latest completed simulation frame.
     pub fn get_latest_frame(&self) -> SimulationFrame {
-        self.latest_frame
-            .lock()
-            .expect("a thread accessing the latest simulation frame panicked")
-            .clone()
+        (*self.latest_frame.load_full()).clone()
     }
     pub fn stop(self) -> SimulationStatistics {
         self.stop.store(true, Ordering::Relaxed);
-        self.join_handle.join().unwrap()
+        self.join_handle.join().expect("failed to join thread")
     }
 }
 
@@ -196,12 +202,10 @@ macro_rules! segment_bench_while {
 fn sim_thread(
     parameters: Arc<Mutex<SimulationParameters>>,
     stop: Arc<AtomicBool>,
-    latest_frame: Arc<Mutex<SimulationFrame>>,
+    latest_frame: Arc<ArcSwap<SimulationFrame>>,
 ) -> SimulationStatistics {
     let (width, height) = {
-        let f = latest_frame
-            .lock()
-            .expect("a thread accessing the simulation parameters panicked");
+        let f = latest_frame.load();
         (f.width, f.height)
     };
     let mut end_of_last_step: Instant = Instant::now();
@@ -211,24 +215,23 @@ fn sim_thread(
     let segments = segment_bench_while!(
     while (!stop.load(Ordering::Relaxed)) {
         {
-            "lock values":
+            "load and lock values":
             let parameters = parameters
                 .lock()
                 .expect("a thread accessing the simulation parameters panicked");
-            let mut latest_frame = latest_frame
-                .lock()
-                .expect("a thread accessing the latest simulation frame data panicked");
+            let mut new_frame = (*latest_frame
+                .load_full()).clone();
         },
         {
             "build burning_neighbors":
             let burning_neighbors: Vec<_> = (0..width * height)
                 .into_par_iter()
-                .map(|i| get_neighboring_cell_info(&latest_frame.grid, i, width, height))
+                .map(|i| get_neighboring_cell_info(&new_frame.grid, i, width, height))
                 .collect();
         },
         {
             "build cell_data":
-            let cell_data: Vec<_> = latest_frame
+            let cell_data: Vec<_> = new_frame
                 .grid
                 .iter_mut()
                 .zip(burning_neighbors.into_iter())
@@ -250,15 +253,18 @@ fn sim_thread(
                 });
         },
         {
+            "write data":
+            latest_frame.store(Arc::new(new_frame));
+        },
+        {
             "cleanup":
             total_time += end_of_last_step.elapsed();
             total_iterations += 1;
             let to_wait =
                 (parameters.tick_rate as f32).recip() - end_of_last_step.elapsed().as_secs_f32();
-            drop(latest_frame);
             drop(parameters);
             if to_wait > 0.0 {
-                std::thread::sleep(Duration::from_secs_f32(to_wait));
+                thread::sleep(Duration::from_secs_f32(to_wait));
             }
             end_of_last_step = Instant::now();
         }
