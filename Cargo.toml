@@ -3,6 +3,9 @@ name = "firesim"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = true
+
 [lib]
 crate-type = ["cdylib"]
 
@@ -17,4 +20,4 @@ wasm-bindgen-rayon = { version = "1.3.0", features = ["no-bundler"] }
 wasm-bindgen-futures = "0.4.56"
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 console_error_panic_hook = "0.1.7"
-wasm_thread = { version = "0.3.3", default-features = false }
+wasm_thread = { version = "0.3.3" }

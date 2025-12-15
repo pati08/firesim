@@ -15,15 +15,36 @@
       // eventually the manual initialization won't be required!
       import init, { initialize, initThreadPool, start } from './pkg/firesim.js';
 
+      function resizeCanvas(canvas) {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+
+          const width  = Math.round(rect.width  * dpr);
+          const height = Math.round(rect.height * dpr);
+
+          if (canvas.width !== width || canvas.height !== height) {
+              canvas.width  = width;
+              canvas.height = height;
+
+              const ctx = canvas.getContext("2d");
+              ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          }
+      }
+
+
       async function run() {
         await init();
-        await initialize();
         await initThreadPool(navigator.hardwareConcurrency);
-        await start();
+        await initialize();
+        let canvas = document.getElementById("sim-surface");
+        resizeCanvas(canvas);
+        canvas.addEventListener("resize", () => resizeCanvas(canvas));
+        globalThis.sim = await start();
       }
 
       run();
     </script>
-    <canvas id="sim-surface" style="width: 100px; height: 100px;"></canvas>
+    <canvas id="sim-surface" style="width: 800px; height: 800px; image-rendering: pixelated;"></canvas>
+    <button onclick='let stats = globalThis.sim.stop(); alert(stats.segments.map(s => s.name.toString() + ": " + s.millis.toString()).join("\n") + "\nTotal: " + stats.average_step_exec_time)'>Stop</button>
   </body>
 </html>

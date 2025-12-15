@@ -1,11 +1,10 @@
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
+use wasm_bindgen::prelude::*;
 
+use js_sys::Date;
 use wasm_thread as thread;
 
 use arc_swap::ArcSwap;
@@ -126,16 +125,26 @@ impl SimulationParameters {
 
 #[non_exhaustive]
 #[derive(Default)]
+#[wasm_bindgen(getter_with_clone)]
 pub struct SimulationStatistics {
-    pub average_step_exec_time: Duration,
-    pub segments: Vec<(&'static str, Duration)>,
+    pub average_step_exec_time: f64,
+    pub segments: Vec<Segment>,
 }
 
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Clone)]
+pub struct Segment {
+    pub name: String,
+    pub millis: f64,
+}
+
+#[wasm_bindgen]
+#[derive(Clone)]
 pub struct Simulation {
     parameters: Arc<Mutex<SimulationParameters>>,
     stop: Arc<AtomicBool>,
     latest_frame: Arc<ArcSwap<SimulationFrame>>,
-    join_handle: thread::JoinHandle<SimulationStatistics>,
+    join_handle: Arc<Mutex<Option<thread::JoinHandle<SimulationStatistics>>>>,
 }
 
 /// Spawn a simulation on a new thread using the provided spawner.
@@ -156,7 +165,7 @@ pub fn spawn_simulation(
         parameters,
         stop,
         latest_frame,
-        join_handle: handle,
+        join_handle: Arc::new(Mutex::new(Some(handle))),
     }
 }
 
@@ -165,15 +174,23 @@ impl Simulation {
     pub fn get_latest_frame(&self) -> SimulationFrame {
         (*self.latest_frame.load_full()).clone()
     }
-    pub fn stop(self) -> SimulationStatistics {
+}
+
+#[wasm_bindgen]
+impl Simulation {
+    #[wasm_bindgen]
+    pub fn stop(self) -> Option<SimulationStatistics> {
         self.stop.store(true, Ordering::Relaxed);
-        self.join_handle.join().expect("failed to join thread")
+        let mut lock = self.join_handle.lock().expect("failed to lock join handle");
+        // let join_handle = lock.replace(None)?;
+        let join_handle = std::mem::replace(&mut *lock, None)?;
+        Some(join_handle.join().expect("failed to join thread"))
     }
 }
 
 macro_rules! segment_bench_while {
     (while ($cond:expr) { $({$name:literal : $($contents:stmt)*}),+ $(,)? }) => {{
-        let mut segments = vec![$(($name, std::time::Duration::new(0, 0))),+];
+        let mut segments = vec![$(($name, 0.0)),+];
         let mut cur_segments = Vec::with_capacity(segments.len());
         let mut iter_count = 0;
 
@@ -181,9 +198,9 @@ macro_rules! segment_bench_while {
             cur_segments.clear();
 
             $(
-                let segment_start = std::time::Instant::now();
+                let segment_start = Date::now();
                 $($contents)*     // all statements, same scope
-                cur_segments.push(segment_start.elapsed());
+                cur_segments.push(Date::now() - segment_start);
             )+
 
             for (idx, item) in cur_segments.iter().enumerate() {
@@ -193,7 +210,7 @@ macro_rules! segment_bench_while {
         }
 
         for s in segments.iter_mut() {
-            s.1 /= iter_count;
+            s.1 /= iter_count as f64;
         }
         segments
     }}
@@ -208,9 +225,9 @@ fn sim_thread(
         let f = latest_frame.load();
         (f.width, f.height)
     };
-    let mut end_of_last_step: Instant = Instant::now();
+    let mut end_of_last_step = Date::now();
     let mut total_iterations = 0;
-    let mut total_time = Duration::new(0, 0);
+    let mut total_time = 0.0;
     #[allow(redundant_semicolons)]
     let segments = segment_bench_while!(
     while (!stop.load(Ordering::Relaxed)) {
@@ -258,21 +275,27 @@ fn sim_thread(
         },
         {
             "cleanup":
-            total_time += end_of_last_step.elapsed();
+            total_time += Date::now() - end_of_last_step;
             total_iterations += 1;
             let to_wait =
-                (parameters.tick_rate as f32).recip() - end_of_last_step.elapsed().as_secs_f32();
+                (parameters.tick_rate as f64).recip() - (Date::now() - end_of_last_step);
             drop(parameters);
             if to_wait > 0.0 {
-                thread::sleep(Duration::from_secs_f32(to_wait));
+                thread::sleep(std::time::Duration::from_secs_f64(to_wait));
             }
-            end_of_last_step = Instant::now();
+            end_of_last_step = Date::now();
         }
     }
     );
     SimulationStatistics {
-        average_step_exec_time: total_time / total_iterations,
-        segments,
+        average_step_exec_time: total_time / total_iterations as f64,
+        segments: segments
+            .into_iter()
+            .map(|i| Segment {
+                name: i.0.to_string(),
+                millis: i.1,
+            })
+            .collect(),
     }
 }
 

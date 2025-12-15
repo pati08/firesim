@@ -6,6 +6,6 @@ rm -rf public
 mkdir public
 cp index.html public
 cargo build --target wasm32-unknown-unknown --release
-wasm-bindgen --target no-modules --out-dir public/pkg target/wasm32-unknown-unknown/release/firesim.wasm
+wasm-bindgen --target web --out-dir public/pkg target/wasm32-unknown-unknown/release/firesim.wasm
 simple-http-server --coep --coop --cors -p 3000 public
 ```

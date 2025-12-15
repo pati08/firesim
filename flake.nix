@@ -49,9 +49,10 @@
             libxkbcommon wayland
             wasm-bindgen-cli
             simple-http-server
+            wasm-pack
             (rust-bin.nightly.latest.default.override {
               extensions = [ "rust-src" "rust-analyzer" "rustfmt" ];
-              targets = [ "x86_64-unknown-linux-gnu" "wasm32-unknown-unknown" ];
+              targets = [ "wasm32-unknown-unknown" ];
             })
           ];
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;

@@ -1,7 +1,11 @@
 {
   "rust-analyzer": {
     "cargo": {
-      "features": "all"
+      "features": "all",
+      "target": "wasm32-unknown-unknown",
+      "buildScripts": {
+        "useRustcWrapper": true
+      }
     }
   }
 }
