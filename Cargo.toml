@@ -21,3 +21,4 @@ wasm-bindgen-futures = "0.4.56"
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 console_error_panic_hook = "0.1.7"
 wasm_thread = { version = "0.3.3" }
+watch = "0.2.3"

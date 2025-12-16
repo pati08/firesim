@@ -93,19 +93,15 @@ pub async fn start() -> Simulation {
     const SIM_HEIGHT: usize = 500;
 
     let start_frame = SimulationFrame::new(SIM_WIDTH, SIM_HEIGHT);
-    let sim_params = SimulationParameters::realistic(SIM_WIDTH, SIM_HEIGHT, 10.0, 36.0);
+    let sim_params = SimulationParameters::realistic(SIM_WIDTH, SIM_HEIGHT, 2.0, 36.0);
     let sim = spawn_simulation(start_frame, sim_params);
 
-    // --- FIX START ---
-    // 1. Change the type to hold the concrete Closure object.
-    // The type parameter for Closure is `FnMut` because `requestAnimationFrame`
-    // can only take a raw JS function, not a safe Rust closure that implements `FnOnce`.
     type RAFClosure = Closure<dyn FnMut()>;
 
     let f: Rc<RefCell<Option<RAFClosure>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
 
-    let s2 = sim.clone();
+    let mut s2 = sim.clone();
 
     // 2. Store the Closure object directly.
     *g.borrow_mut() = Some(Closure::new(move || {

@@ -44,6 +44,7 @@
             pkg-config
           ];
           buildInputs = with pkgs; [
+            watchexec
             udev
             xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr
             libxkbcommon wayland

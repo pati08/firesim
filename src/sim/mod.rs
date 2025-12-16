@@ -3,11 +3,11 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use wasm_bindgen::prelude::*;
+use watch::{WatchReceiver, WatchSender};
 
 use js_sys::Date;
 use wasm_thread as thread;
 
-use arc_swap::ArcSwap;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 #[derive(Clone)]
@@ -59,6 +59,8 @@ impl BurnState {
     }
 }
 
+#[derive(Clone)]
+#[wasm_bindgen]
 /// The parameters controlling the simulation
 pub struct SimulationParameters {
     /// The base chance (0 - 1) that a tree will grow in a given cell each tick
@@ -108,7 +110,7 @@ impl SimulationParameters {
         let tick_rate = tick_rate.round() as u32;
         Self {
             tick_rate,
-            lightning_frequency: 1.0 / acres / 45.0 / 12.0,
+            lightning_frequency: 1.0 * acres / 45.0 / 12.0,
             tree_growth_rate: 1.0 / (ticks_per_month * 12.0 * 150.0),
             tree_death_rate: 1.0 / (ticks_per_month * 12.0 * 200.0),
             underbrush_tree_growth_hindrance: 0.0,
@@ -141,9 +143,11 @@ pub struct Segment {
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct Simulation {
-    parameters: Arc<Mutex<SimulationParameters>>,
+    parameters_tx: WatchSender<SimulationParameters>,
+    parameters_rx: WatchReceiver<SimulationParameters>,
     stop: Arc<AtomicBool>,
-    latest_frame: Arc<ArcSwap<SimulationFrame>>,
+    // latest_frame: Arc<ArcSwap<SimulationFrame>>,
+    latest_frame_rx: WatchReceiver<SimulationFrame>,
     join_handle: Arc<Mutex<Option<thread::JoinHandle<SimulationStatistics>>>>,
 }
 
@@ -151,28 +155,27 @@ pub struct Simulation {
 pub fn spawn_simulation(
     start_frame: SimulationFrame,
     parameters: SimulationParameters,
-    // spawner: S,
 ) -> Simulation {
-    let parameters = Arc::new(Mutex::new(parameters));
+    let (parameters_tx, parameters_rx) = watch::channel(parameters);
     let stop = Arc::new(AtomicBool::new(false));
-    let latest_frame = Arc::new(start_frame);
-    let latest_frame = Arc::new(ArcSwap::from(latest_frame));
-    let p = Arc::clone(&parameters);
+    let (latest_frame_tx, latest_frame_rx) = watch::channel(start_frame.clone());
     let s = Arc::clone(&stop);
-    let l = Arc::clone(&latest_frame);
-    let handle = thread::spawn(|| sim_thread(p, s, l));
+    let p = parameters_rx.clone();
+    let lf_rx = latest_frame_rx.clone();
+    let handle = thread::spawn(|| sim_thread(p, s, latest_frame_tx, lf_rx));
     Simulation {
-        parameters,
+        parameters_tx,
+        parameters_rx,
         stop,
-        latest_frame,
+        latest_frame_rx,
         join_handle: Arc::new(Mutex::new(Some(handle))),
     }
 }
 
 impl Simulation {
     /// Get the latest completed simulation frame.
-    pub fn get_latest_frame(&self) -> SimulationFrame {
-        (*self.latest_frame.load_full()).clone()
+    pub fn get_latest_frame(&mut self) -> SimulationFrame {
+        self.latest_frame_rx.get()
     }
 }
 
@@ -181,10 +184,18 @@ impl Simulation {
     #[wasm_bindgen]
     pub fn stop(self) -> Option<SimulationStatistics> {
         self.stop.store(true, Ordering::Relaxed);
-        let mut lock = self.join_handle.lock().expect("failed to lock join handle");
+        let mut lock = self.join_handle.lock().expect("lock is poisoned");
         // let join_handle = lock.replace(None)?;
         let join_handle = std::mem::replace(&mut *lock, None)?;
         Some(join_handle.join().expect("failed to join thread"))
+    }
+    #[wasm_bindgen]
+    pub fn set_parameters(&mut self, new_params: SimulationParameters) {
+        self.parameters_tx.send(new_params);
+    }
+    #[wasm_bindgen]
+    pub fn get_parameters(&mut self) -> SimulationParameters {
+        self.parameters_rx.get()
     }
 }
 
@@ -217,14 +228,14 @@ macro_rules! segment_bench_while {
 }
 
 fn sim_thread(
-    parameters: Arc<Mutex<SimulationParameters>>,
+    mut parameters_rx: WatchReceiver<SimulationParameters>,
     stop: Arc<AtomicBool>,
-    latest_frame: Arc<ArcSwap<SimulationFrame>>,
+    latest_frame_tx: WatchSender<SimulationFrame>,
+    mut latest_frame_rx: WatchReceiver<SimulationFrame>,
 ) -> SimulationStatistics {
-    let (width, height) = {
-        let f = latest_frame.load();
-        (f.width, f.height)
-    };
+    let start_frame = latest_frame_rx.get();
+    let width = start_frame.width;
+    let height = start_frame.height;
     let mut end_of_last_step = Date::now();
     let mut total_iterations = 0;
     let mut total_time = 0.0;
@@ -232,12 +243,10 @@ fn sim_thread(
     let segments = segment_bench_while!(
     while (!stop.load(Ordering::Relaxed)) {
         {
-            "load and lock values":
-            let parameters = parameters
-                .lock()
-                .expect("a thread accessing the simulation parameters panicked");
-            let mut new_frame = (*latest_frame
-                .load_full()).clone();
+            "load values":
+            let parameters = parameters_rx.get();
+            let mut new_frame = latest_frame_rx
+                .get();
         },
         {
             "build burning_neighbors":
@@ -271,15 +280,19 @@ fn sim_thread(
         },
         {
             "write data":
-            latest_frame.store(Arc::new(new_frame));
+            latest_frame_tx.send(new_frame);
         },
         {
             "cleanup":
             total_time += Date::now() - end_of_last_step;
             total_iterations += 1;
+            if parameters.tick_rate == 0 {
+                parameters_rx.wait();
+                end_of_last_step = Date::now();
+                continue;
+            }
             let to_wait =
                 (parameters.tick_rate as f64).recip() - (Date::now() - end_of_last_step);
-            drop(parameters);
             if to_wait > 0.0 {
                 thread::sleep(std::time::Duration::from_secs_f64(to_wait));
             }

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta content="text/html;charset=utf-8" http-equiv="Content-Type"/>
+  </head>
+  <body>
+    <link rel="stylesheet" href="main.css"/>
+    <main>
+      <canvas id="sim-surface"></canvas>
+      <div id="panels">
+        <div id="controls" class="panel">
+          <h1>Controls</h1>
+          <button id="stopButton">Stop simulation (permanently)</button>
+          <br/>
+          <button id="pauseButton">Pause/resume simulation</button>
+        </div>
+        <div id="stats" class="panel" style="display: none;">
+          <h1>Stats</h1>
+        </div>
+      </div>
+    </main>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

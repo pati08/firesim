@@ -1,0 +1,64 @@
+#sim-surface {
+  height: 80vh;
+  aspect-ratio: 1;
+  image-rendering: crisp-edges;
+}
+
+main {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  align-content: center;
+  gap: 2rem;
+  width: 100vw;
+  height: 100vh;
+}
+
+.panel {
+  padding: 12px;
+  border-radius: 8px;
+  background-color: #ffffff;
+  -webkit-box-shadow: 3px 2px 16px 1px rgba(0,0,0,0.2); 
+  box-shadow: 3px 2px 16px 1px rgba(0,0,0,0.2);
+}
+
+.panel h1 {
+  font-size: 1.25rem;
+  margin-top: 2px;
+  margin-bottom: 16px;
+}
+
+#panels {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+body {
+  background-color: #f8f8f8;
+  font-family: sans-serif;
+  margin: 0px;
+  padding: 0px;
+}
+
+button {
+  padding: 6px;
+  border: none;
+  border-radius: 6px;
+  margin-bottom: 4px;
+  transition-duration: 0.25s;
+  transition-property: background-color;
+}
+
+button:hover {
+  cursor: pointer;
+}
+
+#stopButton {
+  background-color: #ff6060;
+}
+
+#stopButton:hover {
+  background-color: #ffa0a0;
+}
