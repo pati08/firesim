@@ -3,7 +3,7 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 
 use crate::{
     rendering::{RenderMode, RenderSection, RenderState, RenderSurface, RenderSurfaceSize, render},
-    sim::{Simulation, SimulationFrame, ConfigurableParameters, spawn_simulation},
+    sim::{ConfigurableParameters, Simulation, SimulationFrame, spawn_simulation},
 };
 use js_sys::Uint8ClampedArray;
 use wasm_bindgen::prelude::*;
@@ -68,7 +68,7 @@ pub fn initialize() {
 // RenderMode, CanvasRenderSurface, render, and spawn_simulation are defined.
 
 #[wasm_bindgen]
-pub async fn start() -> Simulation {
+pub fn start() -> Simulation {
     let window = web_sys::window().expect("could not get window");
     let canvas: HtmlCanvasElement = window
         .document()

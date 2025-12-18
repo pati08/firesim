@@ -38,20 +38,26 @@ struct Parameters {
 }
 
 @group(0) @binding(0)
-var<storage, read> input: array<Cell>;
+var<storage, read_write> input: array<Cell>;
 // Output of the shader.  
 @group(0) @binding(1)
 var<storage, read_write> output: array<Cell>;
 // Simulation parameters input
 @group(1) @binding(0)
-var<uniform, read> params: Parameters;
+var<uniform> params: Parameters;
 // Size of the grid
 @group(2) @binding(0)
-var <uniform, read> size: vec2<u32>;
+var <uniform> size: vec2<u32>;
 
 fn random(seed: vec2f) -> f32 {
     let dot_product = dot(seed, vec2f(12.9898, 78.233));
     return fract(sin(dot_product) * 43758.5453123);
+}
+
+struct NeighboringCellInfo {
+    trees: u32,
+    fires: u32,
+    underbrush: f32,
 }
 
 // Ideal workgroup size depends on the hardware, the workload, and other factors. However, it should
@@ -71,5 +77,60 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Do the multiply by two and write to the output.
     output[global_id.x] = input[global_id.x];
-    output[global_id.x].tree = f32(global_id.x % 2);
+    let neighbor_info = get_neighboring_cell_info(global_id.x);
+    output[global_id.x].underbrush = min(input[global_id.x].underbrush + (0.005 * neighbor_info.underbrush * f32(size.x) / 50.0), 1);
+    if (global_id.x == 0) {
+        output[global_id.x].underbrush = 1.0;
+    }
+}
+
+fn get_neighboring_cell_info(global_x: u32) -> NeighboringCellInfo {
+    var total_trees: u32 = 0;
+    var total_fires: u32 = 0;
+    var total_underbrush: f32 = 0;
+    let row = global_x / size.x;
+    let col = global_x % size.x;
+    let width = size.x;
+    let height = size.y;
+    if (col > 0) {
+        if (row > 0) {
+            total_trees += u32(ceil(input[global_x - width - 1].tree));
+            total_fires += min(1, input[global_x - width - 1].fire);
+            total_underbrush += input[global_x - width - 1].underbrush;
+        }
+        if (row < size.y - 1) {
+            total_trees += u32(ceil(input[global_x + width - 1].tree));
+            total_fires += min(1, input[global_x + width - 1].fire);
+            total_underbrush += input[global_x + width - 1].underbrush;
+        }
+        total_trees += u32(ceil(input[global_x - 1].tree));
+        total_fires += min(1, input[global_x - 1].fire);
+        total_underbrush += input[global_x - 1].underbrush;
+    }
+    if (col < size.x - 1) {
+        if (row > 0) {
+            total_trees += u32(ceil(input[global_x - width + 1].tree));
+            total_fires += min(1, input[global_x - width + 1].fire);
+            total_underbrush += input[global_x - width + 1].underbrush;
+        }
+        if (row < size.y) {
+            total_trees += u32(ceil(input[global_x + width + 1].tree));
+            total_fires += min(1, input[global_x + width + 1].fire);
+            total_underbrush += input[global_x + width + 1].underbrush;
+        }
+        total_trees += u32(ceil(input[global_x + 1].tree));
+        total_fires += min(1, input[global_x + 1].fire);
+        total_underbrush += input[global_x + 1].underbrush;
+    }
+    if (row > 0) {
+        total_trees += u32(ceil(input[global_x - width].tree));
+        total_fires += min(1, input[global_x - width].fire);
+        total_underbrush += input[global_x - width].underbrush;
+    }
+    if (row < size.y - 1) {
+        total_trees += u32(ceil(input[global_x + width].tree));
+        total_fires += min(1, input[global_x + width].fire);
+        total_underbrush += input[global_x + width].underbrush;
+    }
+    return NeighboringCellInfo(total_trees, total_fires, total_underbrush);
 }

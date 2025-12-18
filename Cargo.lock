@@ -322,6 +322,7 @@ dependencies = [
  "console_error_panic_hook",
  "env_logger",
  "fastrand",
+ "futures-intrusive",
  "gloo-timers",
  "js-sys",
  "pollster",
@@ -414,6 +415,17 @@ dependencies = [
  "futures-core",
  "futures-task",
  "futures-util",
+]
+
+[[package]]
+name = "futures-intrusive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d930c203dd0b6ff06e0201a4a2fe9149b43c684fd4420555b26d21b1a02956f"
+dependencies = [
+ "futures-core",
+ "lock_api",
+ "parking_lot",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use futures_intrusive::channel::shared::{OneshotReceiver, OneshotSender};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -9,11 +10,6 @@ use watch::{WatchReceiver, WatchSender};
 mod gpucompute;
 
 use js_sys::Date;
-use wasm_thread as thread;
-
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
-use crate::sim::gpucompute::ComputeContext;
 
 #[derive(Clone)]
 pub struct SimulationFrame {
@@ -215,7 +211,7 @@ impl From<&ConfigurableParameters> for SimulationParameters {
 }
 
 #[non_exhaustive]
-#[derive(Default)]
+#[derive(Default, Debug)]
 #[wasm_bindgen(getter_with_clone)]
 pub struct SimulationStatistics {
     pub average_step_exec_time: f64,
@@ -227,40 +223,42 @@ pub struct Simulation {
     parameters_tx: WatchSender<ConfigurableParameters>,
     parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,
-    // latest_frame: Arc<ArcSwap<SimulationFrame>>,
     latest_frame_rx: WatchReceiver<SimulationFrame>,
-    join_handle: Arc<Mutex<Option<thread::JoinHandle<SimulationStatistics>>>>,
+    stats_rx: Arc<Mutex<OneshotReceiver<SimulationStatistics>>>,
+    wants_new_frame: Arc<AtomicBool>,
 }
 
-/// Spawn a simulation on a new thread using the provided spawner.
-pub async fn spawn_simulation(
+pub fn spawn_simulation(
     start_frame: SimulationFrame,
     parameters: ConfigurableParameters,
 ) -> Simulation {
     let (parameters_tx, parameters_rx) = watch::channel(parameters);
     let stop = Arc::new(AtomicBool::new(false));
+    let wants_new_frame = Arc::new(AtomicBool::new(false));
     let (latest_frame_tx, latest_frame_rx) = watch::channel(start_frame.clone());
     let s = Arc::clone(&stop);
+    let wnf = Arc::clone(&wants_new_frame);
     let p = parameters_rx.clone();
+    let (stats_tx, stats_rx) = futures_intrusive::channel::shared::oneshot_channel();
     let lf_rx = latest_frame_rx.clone();
-    let compute_context = Arc::new(Mutex::new(
-        ComputeContext::create(start_frame, SimulationParameters::from(&parameters))
-            .await
-            .unwrap(),
-    ));
-    let handle = thread::spawn(|| sim_thread(p, s, latest_frame_tx, lf_rx, compute_context));
+    wasm_bindgen_futures::spawn_local(async move {
+        sim_thread(p, s, latest_frame_tx, lf_rx, stats_tx, wnf).await
+    });
+    let stats_rx = Arc::new(Mutex::new(stats_rx));
     Simulation {
         parameters_tx,
         parameters_rx,
         stop,
         latest_frame_rx,
-        join_handle: Arc::new(Mutex::new(Some(handle))),
+        stats_rx,
+        wants_new_frame,
     }
 }
 
 impl Simulation {
     /// Get the latest completed simulation frame.
     pub fn get_latest_frame(&mut self) -> SimulationFrame {
+        self.wants_new_frame.store(true, Ordering::Relaxed);
         self.latest_frame_rx.get()
     }
 }
@@ -268,12 +266,14 @@ impl Simulation {
 #[wasm_bindgen]
 impl Simulation {
     #[wasm_bindgen]
-    pub fn stop(self) -> Option<SimulationStatistics> {
+    pub async fn stop(self) -> Option<SimulationStatistics> {
         self.stop.store(true, Ordering::Relaxed);
-        let mut lock = self.join_handle.lock().expect("lock is poisoned");
-        // let join_handle = lock.replace(None)?;
-        let join_handle = std::mem::replace(&mut *lock, None)?;
-        Some(join_handle.join().expect("failed to join thread"))
+        crate::log("stopping");
+        self.stats_rx
+            .lock()
+            .expect("failed to get stats rx lock")
+            .receive()
+            .await
     }
     #[wasm_bindgen]
     pub fn set_parameters(&mut self, new_params: ConfigurableParameters) {
@@ -285,47 +285,35 @@ impl Simulation {
     }
 }
 
-fn sim_thread(
+async fn sim_thread(
     mut parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,
     latest_frame_tx: WatchSender<SimulationFrame>,
     mut latest_frame_rx: WatchReceiver<SimulationFrame>,
-    mut context: Arc<Mutex<ComputeContext>>,
-) -> SimulationStatistics {
+    stats_tx: OneshotSender<SimulationStatistics>,
+    wants_new_frame: Arc<AtomicBool>,
+) {
+    let (device, queue) = gpucompute::create_device().await.unwrap();
     let mut end_of_last_step = Date::now();
     let mut total_iterations = 0;
     let mut total_time = 0.0;
+    let mut context = gpucompute::ComputeContext::create(
+        device,
+        queue,
+        latest_frame_rx.get(),
+        SimulationParameters::from(&parameters_rx.get()),
+    )
+    .unwrap();
     while !stop.load(Ordering::Relaxed) {
         let config_params = parameters_rx.get();
         let parameters = SimulationParameters::from(&config_params);
+        let start = Date::now();
         context.compute_step(parameters);
-        // let mut new_frame = latest_frame_rx.get();
-        // let burning_neighbors: Vec<_> = (0..width * height)
-        //     .into_par_iter()
-        //     .map(|i| get_neighboring_cell_info(&new_frame.grid, i, width, height))
-        //     .collect();
-        // let cell_data: Vec<_> = new_frame
-        //     .grid
-        //     .iter_mut()
-        //     .zip(burning_neighbors.into_iter())
-        //     .collect();
-        // cell_data
-        //     .into_par_iter()
-        //     .for_each(|(state, burning_neighbors)| {
-        //         if fastrand::f32() < parameters.lightning_frequency / (width * height) as f32
-        //             && !state.burning.burning()
-        //             && (state.tree || state.underbrush > 0.2)
-        //         {
-        //             let burn_duration = calculate_burn_duration(state, &parameters).max(1);
-        //             state.burning = BurnState::Burning {
-        //                 ticks_remaining: burn_duration,
-        //             }
-        //         }
-        //         apply_simulation_rules(state, &parameters, burning_neighbors)
-        //     });
-        latest_frame_tx.send(context.get_latest());
-        let elapsed = Date::now() - end_of_last_step;
-        total_time += elapsed;
+        total_time += Date::now() - start;
+        if wants_new_frame.load(Ordering::Relaxed) {
+            latest_frame_tx.send(context.get_latest().await);
+            wants_new_frame.store(false, Ordering::Relaxed);
+        }
         total_iterations += 1;
         if parameters.tick_rate == 0 {
             parameters_rx.wait();
@@ -335,13 +323,15 @@ fn sim_thread(
         let to_wait =
             (parameters.tick_rate as f64).recip() * 1000.0 - (Date::now() - end_of_last_step);
         if to_wait > 0.0 {
-            thread::sleep(std::time::Duration::from_secs_f64(to_wait / 1000.0));
+            gloo_timers::future::sleep(std::time::Duration::from_secs_f64(to_wait / 1000.0)).await;
+            // thread::sleep(std::time::Duration::from_secs_f64(to_wait / 1000.0));
         }
         end_of_last_step = Date::now();
     }
-    SimulationStatistics {
+    let stats = SimulationStatistics {
         average_step_exec_time: total_time / total_iterations as f64,
-    }
+    };
+    stats_tx.send(stats).unwrap();
 }
 
 fn apply_simulation_rules(

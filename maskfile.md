@@ -17,5 +17,5 @@ wasm-pack build --target web --profiling --no-opt --out-dir public/pkg
 ## dev
 Watch files and rebuild and serve when they change
 ```bash
-watchexec -e js,css,html,rs,toml -o restart mask serve
+watchexec -e js,css,html,rs,toml,wgsl -o restart mask serve
 ```

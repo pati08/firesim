@@ -1,11 +1,9 @@
-use std::sync::mpsc::channel;
-
 use bytemuck::{Pod, Zeroable};
 use wgpu::{
-    Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, Buffer, BufferDescriptor, BufferUsages, ComputePassDescriptor,
-    ComputePipeline, ComputePipelineDescriptor, Device, Instance, InstanceDescriptor,
-    PipelineCompilationOptions, Queue, ShaderStages,
+    ComputePipeline, ComputePipelineDescriptor, Device, Instance, MapMode,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, ShaderStages,
     util::{BufferInitDescriptor, DeviceExt},
     wgt::CommandEncoderDescriptor,
 };
@@ -18,6 +16,7 @@ struct GpuCell {
     tree: f32,
     underbrush: f32,
     burning: u32,
+    padding: u32,
 }
 
 pub struct ComputeContext {
@@ -35,6 +34,30 @@ pub struct ComputeContext {
     device: Device,
     width: usize,
     height: usize,
+    staging_buf: Buffer,
+}
+pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
+    let instance = Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await?;
+    let downlevel_caps = adapter.get_downlevel_capabilities();
+    if !downlevel_caps
+        .flags
+        .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+    {
+        return Err(anyhow::anyhow!("adapter does not support compute shaders"));
+    }
+    Ok(adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("firesim compute device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        })
+        .await?)
 }
 impl ComputeContext {
     pub fn compute_step(&mut self, parameters: SimulationParameters) {
@@ -44,9 +67,14 @@ impl ComputeContext {
         let num_dispatches = self.buf_1.size().div_ceil(64);
         let mut encoder = self
             .device
-            .create_command_encoder(&CommandEncoderDescriptor::default());
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("simulation step encoder"),
+            });
         {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("simulation step compute pass"),
+                ..Default::default()
+            });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(
                 0,
@@ -61,7 +89,17 @@ impl ComputeContext {
             pass.set_bind_group(2, &self.size_bind_group, &[]);
             pass.dispatch_workgroups(num_dispatches as u32, 1, 1);
         }
+        let src_buf = if self.flipped_bufs {
+            &self.buf_1
+        } else {
+            &self.buf_2
+        };
+        encoder.copy_buffer_to_buffer(src_buf, 0, &self.staging_buf, 0, src_buf.size());
+
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        self.staging_buf.map_async(MapMode::Read, .., |_| ());
+
         self.flipped_bufs = !self.flipped_bufs;
     }
     fn update_params(&mut self, new: SimulationParameters) {
@@ -69,7 +107,9 @@ impl ComputeContext {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&new));
     }
-    pub async fn create(
+    pub fn create(
+        device: Device,
+        queue: Queue,
         start: SimulationFrame,
         parameters: SimulationParameters,
     ) -> Result<Self, anyhow::Error> {
@@ -83,34 +123,13 @@ impl ComputeContext {
                 },
                 tree: if i.tree { 1.0 } else { 0.0 },
                 underbrush: i.underbrush,
+                padding: 0,
             })
             .collect();
-        let instance_desc = InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        };
-        let instance = Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await?;
-        let downlevel_caps = adapter.get_downlevel_capabilities();
-        if !downlevel_caps
-            .flags
-            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
-        {
-            return Err(anyhow::anyhow!("adapter does not support compute shaders"));
-        }
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
-        let shader = device.create_shader_module(wgpu::include_wgsl!("./shader.wgsl"));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("simulation compute shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("./shader.wgsl").into()),
+        });
         // Create a buffer with the data we want to process on the GPU.
         //
         // `create_buffer_init` is a utility provided by `wgpu::util::DeviceExt` which simplifies creating
@@ -118,32 +137,26 @@ impl ComputeContext {
         //
         // We use the `bytemuck` crate to cast the slice of f32 to a &[u8] to be uploaded to the GPU.
         let buf_1 = device.create_buffer_init(&BufferInitDescriptor {
-            label: None,
+            label: Some("cells buffer 1"),
             contents: bytemuck::cast_slice(&start_data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
         // Now we create a buffer to store the output data.
         let buf_2 = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
+            label: Some("cells buffer 2"),
             size: buf_1.size(),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let params_buf = device.create_buffer_init(&BufferInitDescriptor {
-            label: None,
+            label: Some("simulation parameters buffer"),
             contents: bytemuck::bytes_of(&parameters),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        // let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        //     label: None,
-        //     size: buf_1.size(),
-        //     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        //     mapped_at_creation: false,
-        // });
         let cells_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: None,
+            label: Some("cells bind group layout"),
             entries: &[
                 BindGroupLayoutEntry {
                     binding: 0,
@@ -168,7 +181,7 @@ impl ComputeContext {
             ],
         });
         let cells_bg = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
+            label: Some("cells bind group (buf1 -> buf2)"),
             layout: &cells_bg_layout,
             entries: &[
                 BindGroupEntry {
@@ -182,7 +195,7 @@ impl ComputeContext {
             ],
         });
         let cells_bg_rev = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
+            label: Some("cells bind group (buf2 -> buf1)"),
             layout: &cells_bg_layout,
             entries: &[
                 BindGroupEntry {
@@ -196,7 +209,7 @@ impl ComputeContext {
             ],
         });
         let params_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: None,
+            label: Some("parameters bind group layout"),
             entries: &[BindGroupLayoutEntry {
                 binding: 0,
                 visibility: ShaderStages::COMPUTE,
@@ -209,7 +222,7 @@ impl ComputeContext {
             }],
         });
         let params_bg = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
+            label: Some("parameters bind group"),
             layout: &params_bg_layout,
             entries: &[BindGroupEntry {
                 binding: 0,
@@ -217,7 +230,7 @@ impl ComputeContext {
             }],
         });
         let size_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: None,
+            label: Some("grid size bind group layout"),
             entries: &[BindGroupLayoutEntry {
                 binding: 0,
                 visibility: ShaderStages::COMPUTE,
@@ -230,25 +243,36 @@ impl ComputeContext {
             }],
         });
         let size_buf = device.create_buffer_init(&BufferInitDescriptor {
-            label: None,
+            label: Some("grid size buffer"),
             contents: bytemuck::cast_slice(&[start.width as u32, start.height as u32]),
             usage: BufferUsages::UNIFORM,
         });
         let size_bg = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
+            label: Some("grid size bind group"),
             layout: &size_bg_layout,
             entries: &[BindGroupEntry {
                 binding: 0,
                 resource: size_buf.as_entire_binding(),
             }],
         });
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("simulation pipeline layout"),
+            bind_group_layouts: &[&cells_bg_layout, &params_bg_layout, &size_bg_layout],
+            push_constant_ranges: &[],
+        });
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: None,
-            layout: None,
+            label: Some("simulation compute pipeline"),
+            layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: None,
             compilation_options: PipelineCompilationOptions::default(),
             cache: None,
+        });
+        let staging_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("staging buffer"),
+            size: buf_1.size(),
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         Ok(Self {
             buf_1,
@@ -265,32 +289,32 @@ impl ComputeContext {
             pipeline,
             width: start.width,
             height: start.height,
+            staging_buf,
         })
     }
-    pub fn get_latest(&self) -> SimulationFrame {
-        let tmpbuf = self.device.create_buffer(&BufferDescriptor {
-            label: None,
-            size: self.buf_1.size(),
-            mapped_at_creation: false,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-        });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor::default());
-        let src_buf = if self.flipped_bufs {
-            &self.buf_1
-        } else {
-            &self.buf_2
-        };
-        encoder.copy_buffer_to_buffer(src_buf, 0, &tmpbuf, 0, None);
-        let (tx, rx) = channel();
-        tmpbuf.map_async(wgpu::MapMode::Read, .., move |v| {
-            tx.send(v).unwrap();
-        });
-        rx.recv().unwrap().expect("failed to map buffer");
-        let buf_view = tmpbuf.get_mapped_range(..);
+    pub async fn get_latest(&self) -> SimulationFrame {
+        let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
+
+        // 1. Request the map
+        self.staging_buf
+            .map_async(wgpu::MapMode::Read, .., move |res| {
+                tx.send(res).unwrap();
+            });
+
+        // 2. Tell the GPU to catch up
+        // Using Wait ensures that the callback above WILL be called before this returns
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU device lost");
+
+        // 3. Wait for the channel to confirm mapping is successful
+        rx.receive()
+            .await
+            .unwrap()
+            .expect("Failed to map staging buffer");
+        let buf_view = self.staging_buf.get_mapped_range(..);
         let cells: &[GpuCell] = bytemuck::cast_slice(buf_view.as_ref());
-        SimulationFrame {
+        let frame = SimulationFrame {
             grid: cells
                 .iter()
                 .map(|i| CellState {
@@ -307,6 +331,9 @@ impl ComputeContext {
                 .collect(),
             width: self.width,
             height: self.height,
-        }
+        };
+        drop(buf_view);
+        self.staging_buf.unmap();
+        frame
     }
 }

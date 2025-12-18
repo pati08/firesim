@@ -62,9 +62,9 @@ fn display_simframe(
     let ratio_y = frame.height as f32 / height as f32;
     for x in 0..width {
         for y in 0..height {
-            let cell_x = (x as f32 * ratio_x).round() as usize;
+            let cell_x = (x as f32 * ratio_x) as usize;
             let cell_x = cell_x.min(frame.width - 1);
-            let cell_y = (y as f32 * ratio_y).round() as usize;
+            let cell_y = (y as f32 * ratio_y) as usize;
             let cell_y = cell_y.min(frame.height - 1);
             let state = &frame.grid[cell_x + cell_y * frame.width];
             buf[x + offset_x + (y + offset_y) * width] = match mode {

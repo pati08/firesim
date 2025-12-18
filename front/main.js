@@ -57,9 +57,9 @@ async function run() {
 
 run();
 
-function stopButtonClicked() {
-  let stats = sim.stop();
-  let stats_text = stats.segments.map(s => s.name.toString() + ": " + s.millis.toPrecision(2).toString()).join("\n") + "\nTotal: " + stats.average_step_exec_time.toPrecision(2);
+async function stopButtonClicked() {
+  let stats = await sim.stop();
+  let stats_text = "Average time per step: " + stats.average_step_exec_time.toPrecision(2) + "ms";
   let stats_panel = document.getElementById("stats");
   stats_panel.style.display = "block";
   let end = document.createElement("p");
