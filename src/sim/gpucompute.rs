@@ -1,4 +1,7 @@
+use std::sync::{Arc, atomic::AtomicBool};
+
 use bytemuck::{Pod, Zeroable};
+use js_sys::Date;
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, Buffer, BufferDescriptor, BufferUsages, ComputePassDescriptor,
@@ -35,6 +38,7 @@ pub struct ComputeContext {
     width: usize,
     height: usize,
     staging_buf: Buffer,
+    is_ready: Arc<AtomicBool>,
 }
 pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
     let instance = Instance::new(&wgpu::InstanceDescriptor::default());
@@ -98,7 +102,15 @@ impl ComputeContext {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        self.staging_buf.map_async(MapMode::Read, .., |_| ());
+        let ready_clone = self.is_ready.clone();
+        ready_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        self.staging_buf
+            .map_async(MapMode::Read, .., move |result| {
+                if result.is_ok() {
+                    ready_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
 
         self.flipped_bufs = !self.flipped_bufs;
     }
@@ -290,50 +302,36 @@ impl ComputeContext {
             width: start.width,
             height: start.height,
             staging_buf,
+            is_ready: Arc::new(AtomicBool::new(false)),
         })
     }
     pub async fn get_latest(&self) -> SimulationFrame {
-        let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-
-        // 1. Request the map
-        self.staging_buf
-            .map_async(wgpu::MapMode::Read, .., move |res| {
-                tx.send(res).unwrap();
-            });
-
-        // 2. Tell the GPU to catch up
-        // Using Wait ensures that the callback above WILL be called before this returns
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU device lost");
-
-        // 3. Wait for the channel to confirm mapping is successful
-        rx.receive()
-            .await
-            .unwrap()
-            .expect("Failed to map staging buffer");
-        let buf_view = self.staging_buf.get_mapped_range(..);
-        let cells: &[GpuCell] = bytemuck::cast_slice(buf_view.as_ref());
-        let frame = SimulationFrame {
-            grid: cells
-                .iter()
-                .map(|i| CellState {
-                    burning: if i.burning > 0 {
-                        BurnState::Burning {
-                            ticks_remaining: i.burning,
-                        }
-                    } else {
-                        BurnState::NotBurning
-                    },
-                    underbrush: i.underbrush,
-                    tree: i.tree > 0.0,
-                })
-                .collect(),
-            width: self.width,
-            height: self.height,
-        };
-        drop(buf_view);
-        self.staging_buf.unmap();
-        frame
+        if self.is_ready.load(std::sync::atomic::Ordering::SeqCst) {
+            let buf_view = self.staging_buf.get_mapped_range(..);
+            let cells: &[GpuCell] = bytemuck::cast_slice(buf_view.as_ref());
+            let frame = SimulationFrame {
+                grid: cells
+                    .iter()
+                    .map(|i| CellState {
+                        burning: if i.burning > 0 {
+                            BurnState::Burning {
+                                ticks_remaining: i.burning,
+                            }
+                        } else {
+                            BurnState::NotBurning
+                        },
+                        underbrush: i.underbrush,
+                        tree: i.tree > 0.0,
+                    })
+                    .collect(),
+                width: self.width,
+                height: self.height,
+            };
+            drop(buf_view);
+            self.staging_buf.unmap();
+            frame
+        } else {
+            SimulationFrame::default()
+        }
     }
 }
