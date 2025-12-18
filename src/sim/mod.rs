@@ -1,3 +1,4 @@
+use bytemuck::{Pod, Zeroable};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -5,10 +6,14 @@ use std::sync::{
 use wasm_bindgen::prelude::*;
 use watch::{WatchReceiver, WatchSender};
 
+mod gpucompute;
+
 use js_sys::Date;
 use wasm_thread as thread;
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+use crate::sim::gpucompute::ComputeContext;
 
 #[derive(Clone)]
 pub struct SimulationFrame {
@@ -59,18 +64,99 @@ impl BurnState {
     }
 }
 
+/// Configuration parameters with realistic units and static forest properties.
+/// These parameters are grounded in reality and are used to compute the internal
+/// SimulationParameters struct.
 #[derive(Clone)]
 #[wasm_bindgen]
-/// The parameters controlling the simulation
-pub struct SimulationParameters {
-    /// The base chance (0 - 1) that a tree will grow in a given cell each tick
-    pub tree_growth_rate: f32,
+pub struct ConfigurableParameters {
+    // Static parameters - forest size
+    /// Width of the forest in cells
+    pub forest_width: usize,
+    /// Height of the forest in cells
+    pub forest_height: usize,
+    /// Size of the forest in acres (computed from width and height)
+    pub forest_acres: f32,
+
+    // Time scale parameters
+    /// Number of simulation ticks per month
+    pub ticks_per_month: f32,
+    /// Number of months that pass per second of real time
+    pub months_per_second: f32,
+
+    // Realistic configurable parameters
+    /// Lightning strike frequency in strikes per year per acre
+    pub lightning_strikes_per_year_per_acre: f32,
+    /// Tree growth rate: average years for a tree to grow (e.g., 150.0 means 1/150 per year)
+    pub tree_growth_years: f32,
+    /// Tree death rate: average years for a tree to die naturally (e.g., 200.0 means 1/200 per year)
+    pub tree_death_years: f32,
     /// The factor by which the tree growth rate is reduced with underbrush.
     /// The final growth rate is calculated as
     /// ```
     /// let final_growth_rate = (1.0 - underbrush_tree_growth_hindrance * underbrush) *
     /// tree_growth_rate;
     /// ```
+    pub underbrush_tree_growth_hindrance: f32,
+    /// The base rate of underbrush accumulation per tick
+    pub tree_underbrush_generation: f32,
+    /// The amount of underbrush created when a tree dies naturally
+    pub tree_death_underbrush: f32,
+    /// The length a single tree can support a fire for in ticks
+    pub tree_fire_duration: u32,
+    /// The length that underbrush can support a fire for in ticks. This is
+    /// multiplied by the amount of underbrush
+    pub underbrush_fire_duration: u32,
+    /// The base chance (0 - 1) that fire spreads from a particular cell to a
+    /// particular neighbor cell
+    pub fire_spread_rate: f32,
+    /// The multiplier for fire spread rate for trees
+    pub tree_flammability: f32,
+    /// The multiplier for fire spread rate for underbrush (multiplied by the
+    /// amount of underbrush). This is added with the value from tree_flammability
+    /// to calculate the final chance
+    pub underbrush_flammability: f32,
+}
+
+impl ConfigurableParameters {
+    /// Create realistic default parameters for a forest of the given size
+    pub fn realistic(
+        width: usize,
+        height: usize,
+        ticks_per_month: f32,
+        months_per_second: f32,
+    ) -> ConfigurableParameters {
+        let forest_acres = (width as f32 * height as f32) / 4047.0;
+        Self {
+            forest_width: width,
+            forest_height: height,
+            forest_acres,
+            ticks_per_month,
+            months_per_second,
+            lightning_strikes_per_year_per_acre: 1.0 / 45.0, // ~1 strike per 45 acres per year
+            tree_growth_years: 150.0,
+            tree_death_years: 200.0,
+            underbrush_tree_growth_hindrance: 0.0,
+            tree_underbrush_generation: 0.0001,
+            tree_death_underbrush: 0.01,
+            tree_fire_duration: 1,
+            underbrush_fire_duration: 1,
+            fire_spread_rate: 1.0,
+            tree_flammability: 0.5,
+            underbrush_flammability: 1.0,
+        }
+    }
+}
+
+/// Internal computed parameters derived from ConfigurableParameters.
+/// This struct contains per-tick values computed from the realistic units
+/// in ConfigurableParameters.
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq)]
+#[repr(C)]
+pub struct SimulationParameters {
+    /// The base chance (0 - 1) that a tree will grow in a given cell each tick
+    pub tree_growth_rate: f32,
+    /// The factor by which the tree growth rate is reduced with underbrush.
     pub underbrush_tree_growth_hindrance: f32,
     /// The base rate of underbrush accumulation
     pub tree_underbrush_generation: f32,
@@ -98,29 +184,32 @@ pub struct SimulationParameters {
     pub tick_rate: u32,
 }
 
-impl SimulationParameters {
-    pub fn realistic(
-        width: usize,
-        height: usize,
-        ticks_per_month: f32,
-        months_per_second: f32,
-    ) -> SimulationParameters {
-        let acres = (width as f32 * height as f32) / 4047.0;
-        let tick_rate = ticks_per_month * months_per_second;
-        let tick_rate = tick_rate.round() as u32;
+impl From<&ConfigurableParameters> for SimulationParameters {
+    fn from(config: &ConfigurableParameters) -> Self {
+        let tick_rate = (config.ticks_per_month * config.months_per_second).round() as u32;
+        let ticks_per_year = config.ticks_per_month * 12.0;
+
+        // Convert lightning strikes per year per acre to per-tick probability
+        let lightning_frequency =
+            config.lightning_strikes_per_year_per_acre * config.forest_acres / ticks_per_year;
+
+        // Convert tree growth/death rates from years to per-tick probabilities
+        let tree_growth_rate = 1.0 / (ticks_per_year * config.tree_growth_years);
+        let tree_death_rate = 1.0 / (ticks_per_year * config.tree_death_years);
+
         Self {
             tick_rate,
-            lightning_frequency: 1.0 * acres / 45.0 / 12.0,
-            tree_growth_rate: 1.0 / (ticks_per_month * 12.0 * 150.0),
-            tree_death_rate: 1.0 / (ticks_per_month * 12.0 * 200.0),
-            underbrush_tree_growth_hindrance: 0.0,
-            tree_underbrush_generation: 0.0001,
-            tree_death_underbrush: 0.01,
-            tree_fire_duration: 1,
-            underbrush_fire_duration: 1,
-            fire_spread_rate: 1.0,
-            tree_flammability: 0.5,
-            underbrush_flammability: 1.0,
+            lightning_frequency,
+            tree_growth_rate,
+            tree_death_rate,
+            underbrush_tree_growth_hindrance: config.underbrush_tree_growth_hindrance,
+            tree_underbrush_generation: config.tree_underbrush_generation,
+            tree_death_underbrush: config.tree_death_underbrush,
+            tree_fire_duration: config.tree_fire_duration,
+            underbrush_fire_duration: config.underbrush_fire_duration,
+            fire_spread_rate: config.fire_spread_rate,
+            tree_flammability: config.tree_flammability,
+            underbrush_flammability: config.underbrush_flammability,
         }
     }
 }
@@ -130,21 +219,13 @@ impl SimulationParameters {
 #[wasm_bindgen(getter_with_clone)]
 pub struct SimulationStatistics {
     pub average_step_exec_time: f64,
-    pub segments: Vec<Segment>,
-}
-
-#[wasm_bindgen(getter_with_clone)]
-#[derive(Clone)]
-pub struct Segment {
-    pub name: String,
-    pub millis: f64,
 }
 
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct Simulation {
-    parameters_tx: WatchSender<SimulationParameters>,
-    parameters_rx: WatchReceiver<SimulationParameters>,
+    parameters_tx: WatchSender<ConfigurableParameters>,
+    parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,
     // latest_frame: Arc<ArcSwap<SimulationFrame>>,
     latest_frame_rx: WatchReceiver<SimulationFrame>,
@@ -152,9 +233,9 @@ pub struct Simulation {
 }
 
 /// Spawn a simulation on a new thread using the provided spawner.
-pub fn spawn_simulation(
+pub async fn spawn_simulation(
     start_frame: SimulationFrame,
-    parameters: SimulationParameters,
+    parameters: ConfigurableParameters,
 ) -> Simulation {
     let (parameters_tx, parameters_rx) = watch::channel(parameters);
     let stop = Arc::new(AtomicBool::new(false));
@@ -162,7 +243,12 @@ pub fn spawn_simulation(
     let s = Arc::clone(&stop);
     let p = parameters_rx.clone();
     let lf_rx = latest_frame_rx.clone();
-    let handle = thread::spawn(|| sim_thread(p, s, latest_frame_tx, lf_rx));
+    let compute_context = Arc::new(Mutex::new(
+        ComputeContext::create(start_frame, SimulationParameters::from(&parameters))
+            .await
+            .unwrap(),
+    ));
+    let handle = thread::spawn(|| sim_thread(p, s, latest_frame_tx, lf_rx, compute_context));
     Simulation {
         parameters_tx,
         parameters_rx,
@@ -190,125 +276,71 @@ impl Simulation {
         Some(join_handle.join().expect("failed to join thread"))
     }
     #[wasm_bindgen]
-    pub fn set_parameters(&mut self, new_params: SimulationParameters) {
+    pub fn set_parameters(&mut self, new_params: ConfigurableParameters) {
         self.parameters_tx.send(new_params);
     }
     #[wasm_bindgen]
-    pub fn get_parameters(&mut self) -> SimulationParameters {
+    pub fn get_parameters(&mut self) -> ConfigurableParameters {
         self.parameters_rx.get()
     }
 }
 
-macro_rules! segment_bench_while {
-    (while ($cond:expr) { $({$name:literal : $($contents:stmt)*}),+ $(,)? }) => {{
-        let mut segments = vec![$(($name, 0.0)),+];
-        let mut cur_segments = Vec::with_capacity(segments.len());
-        let mut iter_count = 0;
-
-        while $cond {
-            cur_segments.clear();
-
-            $(
-                let segment_start = Date::now();
-                $($contents)*     // all statements, same scope
-                cur_segments.push(Date::now() - segment_start);
-            )+
-
-            for (idx, item) in cur_segments.iter().enumerate() {
-                segments[idx].1 += *item;
-            }
-            iter_count += 1;
-        }
-
-        for s in segments.iter_mut() {
-            s.1 /= iter_count as f64;
-        }
-        segments
-    }}
-}
-
 fn sim_thread(
-    mut parameters_rx: WatchReceiver<SimulationParameters>,
+    mut parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,
     latest_frame_tx: WatchSender<SimulationFrame>,
     mut latest_frame_rx: WatchReceiver<SimulationFrame>,
+    mut context: Arc<Mutex<ComputeContext>>,
 ) -> SimulationStatistics {
-    let start_frame = latest_frame_rx.get();
-    let width = start_frame.width;
-    let height = start_frame.height;
     let mut end_of_last_step = Date::now();
     let mut total_iterations = 0;
     let mut total_time = 0.0;
-    #[allow(redundant_semicolons)]
-    let segments = segment_bench_while!(
-    while (!stop.load(Ordering::Relaxed)) {
-        {
-            "load values":
-            let parameters = parameters_rx.get();
-            let mut new_frame = latest_frame_rx
-                .get();
-        },
-        {
-            "build burning_neighbors":
-            let burning_neighbors: Vec<_> = (0..width * height)
-                .into_par_iter()
-                .map(|i| get_neighboring_cell_info(&new_frame.grid, i, width, height))
-                .collect();
-        },
-        {
-            "build cell_data":
-            let cell_data: Vec<_> = new_frame
-                .grid
-                .iter_mut()
-                .zip(burning_neighbors.into_iter())
-                .collect();
-        },
-        {
-            "apply simulation rules":
-            cell_data
-                .into_par_iter()
-                .for_each(|(state, burning_neighbors)| {
-                    if fastrand::f32() < parameters.lightning_frequency / (width * height) as f32
-                        && !state.burning.burning()
-                    {
-                        state.burning = BurnState::Burning {
-                            ticks_remaining: calculate_burn_duration(state, &parameters),
-                        }
-                    }
-                    apply_simulation_rules(state, &parameters, burning_neighbors)
-                });
-        },
-        {
-            "write data":
-            latest_frame_tx.send(new_frame);
-        },
-        {
-            "cleanup":
-            total_time += Date::now() - end_of_last_step;
-            total_iterations += 1;
-            if parameters.tick_rate == 0 {
-                parameters_rx.wait();
-                end_of_last_step = Date::now();
-                continue;
-            }
-            let to_wait =
-                (parameters.tick_rate as f64).recip() - (Date::now() - end_of_last_step);
-            if to_wait > 0.0 {
-                thread::sleep(std::time::Duration::from_secs_f64(to_wait));
-            }
+    while !stop.load(Ordering::Relaxed) {
+        let config_params = parameters_rx.get();
+        let parameters = SimulationParameters::from(&config_params);
+        context.compute_step(parameters);
+        // let mut new_frame = latest_frame_rx.get();
+        // let burning_neighbors: Vec<_> = (0..width * height)
+        //     .into_par_iter()
+        //     .map(|i| get_neighboring_cell_info(&new_frame.grid, i, width, height))
+        //     .collect();
+        // let cell_data: Vec<_> = new_frame
+        //     .grid
+        //     .iter_mut()
+        //     .zip(burning_neighbors.into_iter())
+        //     .collect();
+        // cell_data
+        //     .into_par_iter()
+        //     .for_each(|(state, burning_neighbors)| {
+        //         if fastrand::f32() < parameters.lightning_frequency / (width * height) as f32
+        //             && !state.burning.burning()
+        //             && (state.tree || state.underbrush > 0.2)
+        //         {
+        //             let burn_duration = calculate_burn_duration(state, &parameters).max(1);
+        //             state.burning = BurnState::Burning {
+        //                 ticks_remaining: burn_duration,
+        //             }
+        //         }
+        //         apply_simulation_rules(state, &parameters, burning_neighbors)
+        //     });
+        latest_frame_tx.send(context.get_latest());
+        let elapsed = Date::now() - end_of_last_step;
+        total_time += elapsed;
+        total_iterations += 1;
+        if parameters.tick_rate == 0 {
+            parameters_rx.wait();
             end_of_last_step = Date::now();
+            continue;
         }
+        let to_wait =
+            (parameters.tick_rate as f64).recip() * 1000.0 - (Date::now() - end_of_last_step);
+        if to_wait > 0.0 {
+            thread::sleep(std::time::Duration::from_secs_f64(to_wait / 1000.0));
+        }
+        end_of_last_step = Date::now();
     }
-    );
     SimulationStatistics {
         average_step_exec_time: total_time / total_iterations as f64,
-        segments: segments
-            .into_iter()
-            .map(|i| Segment {
-                name: i.0.to_string(),
-                millis: i.1,
-            })
-            .collect(),
     }
 }
 

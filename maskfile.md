@@ -11,8 +11,7 @@ Build the webassembly binary and generate JS bindings
 ```bash
 rm -rf public
 cp -r front public
-cargo build --target wasm32-unknown-unknown --release
-wasm-bindgen --target web --out-dir public/pkg target/wasm32-unknown-unknown/release/firesim.wasm
+wasm-pack build --target web --profiling --no-opt --out-dir public/pkg
 ```
 
 ## dev

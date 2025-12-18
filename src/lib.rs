@@ -3,7 +3,7 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 
 use crate::{
     rendering::{RenderMode, RenderSection, RenderState, RenderSurface, RenderSurfaceSize, render},
-    sim::{Simulation, SimulationFrame, SimulationParameters, spawn_simulation},
+    sim::{Simulation, SimulationFrame, ConfigurableParameters, spawn_simulation},
 };
 use js_sys::Uint8ClampedArray;
 use wasm_bindgen::prelude::*;
@@ -64,7 +64,7 @@ pub fn initialize() {
 }
 
 // ... (Your structs and imports remain the same)
-// Assuming SimulationFrame, SimulationParameters, RenderState, RenderSection,
+// Assuming SimulationFrame, ConfigurableParameters, RenderState, RenderSection,
 // RenderMode, CanvasRenderSurface, render, and spawn_simulation are defined.
 
 #[wasm_bindgen]
@@ -93,7 +93,7 @@ pub async fn start() -> Simulation {
     const SIM_HEIGHT: usize = 500;
 
     let start_frame = SimulationFrame::new(SIM_WIDTH, SIM_HEIGHT);
-    let sim_params = SimulationParameters::realistic(SIM_WIDTH, SIM_HEIGHT, 2.0, 36.0);
+    let sim_params = ConfigurableParameters::realistic(SIM_WIDTH, SIM_HEIGHT, 2.0, 36.0);
     let sim = spawn_simulation(start_frame, sim_params);
 
     type RAFClosure = Closure<dyn FnMut()>;

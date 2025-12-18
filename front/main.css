@@ -33,6 +33,9 @@ main {
   display: flex;
   flex-direction: column;
   gap: 2rem;
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 20px;
 }
 
 body {
@@ -61,4 +64,30 @@ button:hover {
 
 #stopButton:hover {
   background-color: #ffa0a0;
+}
+
+#static-params p,
+#mutable-params p {
+  display: inline;
+  margin: 4px 0;
+}
+
+#static-params span {
+  display: inline;
+  color: #333;
+}
+
+#mutable-params input {
+  display: inline;
+  margin-left: 8px;
+  padding: 4px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  width: 120px;
+}
+
+#mutable-params input:focus {
+  outline: none;
+  border-color: #4a90e2;
+  box-shadow: 0 0 0 2px rgba(74, 144, 226, 0.2);
 }
