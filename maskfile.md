@@ -11,7 +11,7 @@ Build the webassembly binary and generate JS bindings
 ```bash
 rm -rf public
 cp -r front public
-wasm-pack build --target web --profiling --no-opt --out-dir public/pkg
+wasm-pack build --target web --profiling --no-opt --weak-refs --out-dir public/pkg
 ```
 
 ## dev

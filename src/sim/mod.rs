@@ -3,6 +3,7 @@ use futures_intrusive::channel::shared::{OneshotReceiver, OneshotSender};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use wasm_bindgen::prelude::*;
 use watch::{WatchReceiver, WatchSender};
@@ -15,7 +16,7 @@ use js_sys::Date;
 pub struct SimulationFrame {
     pub width: usize,
     pub height: usize,
-    pub grid: Vec<CellState>,
+    pub grid: Arc<[CellState]>,
 }
 
 impl SimulationFrame {
@@ -30,7 +31,8 @@ impl SimulationFrame {
                     underbrush: 0.0
                 };
                 width * height
-            ],
+            ]
+            .into(),
         }
     }
 }
@@ -52,12 +54,6 @@ pub struct CellState {
 pub enum BurnState {
     NotBurning,
     Burning { ticks_remaining: u32 },
-}
-
-impl BurnState {
-    fn burning(&self) -> bool {
-        matches!(self, &BurnState::Burning { .. })
-    }
 }
 
 /// Configuration parameters with realistic units and static forest properties.
@@ -241,9 +237,12 @@ pub fn spawn_simulation(
     let p = parameters_rx.clone();
     let (stats_tx, stats_rx) = futures_intrusive::channel::shared::oneshot_channel();
     let lf_rx = latest_frame_rx.clone();
-    wasm_bindgen_futures::spawn_local(async move {
-        sim_thread(p, s, latest_frame_tx, lf_rx, stats_tx, wnf).await
+    let (stx, srx) = mpsc::channel();
+    wasm_thread::spawn(move || {
+        srx.recv().unwrap();
+        sim_thread(p, s, latest_frame_tx, lf_rx, stats_tx, wnf)
     });
+    stx.send(()).unwrap();
     let stats_rx = Arc::new(Mutex::new(stats_rx));
     Simulation {
         parameters_tx,
@@ -285,7 +284,17 @@ impl Simulation {
     }
 }
 
-async fn sim_thread(
+#[wasm_bindgen(module = "/js/secure-context.js")]
+extern "C" {
+    fn is_secure_context() -> bool;
+}
+
+#[wasm_bindgen(module = "/js/testing.js")]
+extern "C" {
+    async fn js_tests();
+}
+
+fn sim_thread(
     mut parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,
     latest_frame_tx: WatchSender<SimulationFrame>,
@@ -293,7 +302,10 @@ async fn sim_thread(
     stats_tx: OneshotSender<SimulationStatistics>,
     wants_new_frame: Arc<AtomicBool>,
 ) {
-    let (device, queue) = gpucompute::create_device().await.unwrap();
+    // let is_secure_context = is_secure_context();
+    // pollster::block_on(js_tests());
+    // crate::log(&format!("secure context: {is_secure_context}"));
+    let (device, queue) = pollster::block_on(gpucompute::create_device()).unwrap();
     let mut end_of_last_step = Date::now();
     let mut total_iterations = 0;
     let mut total_time = 0.0;
@@ -302,17 +314,16 @@ async fn sim_thread(
         queue,
         latest_frame_rx.get(),
         SimulationParameters::from(&parameters_rx.get()),
+        latest_frame_tx,
     )
     .unwrap();
     while !stop.load(Ordering::Relaxed) {
         let config_params = parameters_rx.get();
         let parameters = SimulationParameters::from(&config_params);
-        let start = Date::now();
         context.compute_step(parameters);
-        total_time += Date::now() - start;
+        total_time += Date::now() - end_of_last_step;
         if wants_new_frame.load(Ordering::Relaxed) {
-            latest_frame_tx.send(context.get_latest().await);
-            wants_new_frame.store(false, Ordering::Relaxed);
+            context.send_latest();
         }
         total_iterations += 1;
         if parameters.tick_rate == 0 {
@@ -323,8 +334,12 @@ async fn sim_thread(
         let to_wait =
             (parameters.tick_rate as f64).recip() * 1000.0 - (Date::now() - end_of_last_step);
         if to_wait > 0.0 {
-            gloo_timers::future::sleep(std::time::Duration::from_secs_f64(to_wait / 1000.0)).await;
-            // thread::sleep(std::time::Duration::from_secs_f64(to_wait / 1000.0));
+            crate::log(&format!("sleeping for {}", to_wait));
+            let sleep_start = Date::now();
+            while !(Date::now() - sleep_start >= to_wait) {
+                std::thread::yield_now();
+            }
+            crate::log(&format!("slept for {}", Date::now() - sleep_start));
         }
         end_of_last_step = Date::now();
     }
@@ -332,120 +347,4 @@ async fn sim_thread(
         average_step_exec_time: total_time / total_iterations as f64,
     };
     stats_tx.send(stats).unwrap();
-}
-
-fn apply_simulation_rules(
-    state: &mut CellState,
-    parameters: &SimulationParameters,
-    neighboring_cell_info: NeighboringCellInfo,
-) {
-    handle_burn(state);
-    let total_flammability = if state.tree {
-        parameters.tree_flammability
-    } else {
-        0.0
-    } + state.underbrush * parameters.underbrush_flammability;
-    let already_burning = state.burning.burning();
-    let burning = already_burning
-        || fastrand::f32()
-            < (neighboring_cell_info.fires as f32 / 8.0)
-                * parameters.fire_spread_rate
-                * total_flammability;
-    let new_burn_state = if already_burning || !burning {
-        state.burning.clone()
-    } else {
-        BurnState::Burning {
-            ticks_remaining: calculate_burn_duration(state, parameters),
-        }
-    };
-
-    let tree_dies = state.tree && fastrand::f32() < parameters.tree_death_rate;
-
-    let tree = state.tree
-        || !burning
-            && fastrand::f32()
-                < parameters.tree_growth_rate
-                    * (1.0 - parameters.underbrush_tree_growth_hindrance * state.underbrush);
-
-    let underbrush = state.underbrush
-        + parameters.tree_underbrush_generation * (tree as u8 + neighboring_cell_info.trees) as f32
-        + parameters.tree_death_underbrush * (tree_dies as u32 as f32);
-
-    state.underbrush = underbrush;
-    state.tree = tree;
-    state.burning = new_burn_state;
-}
-
-fn handle_burn(cell: &mut CellState) {
-    let CellState {
-        burning: BurnState::Burning { ticks_remaining },
-        ..
-    } = cell
-    else {
-        return;
-    };
-    if *ticks_remaining > 0 {
-        *ticks_remaining -= 1;
-    }
-    if *ticks_remaining > 1 {
-        return;
-    }
-
-    cell.burning = BurnState::NotBurning;
-    cell.tree = false;
-    cell.underbrush = 0.0;
-}
-
-fn calculate_burn_duration(state: &CellState, parameters: &SimulationParameters) -> u32 {
-    (state.underbrush * parameters.underbrush_fire_duration as f32).round() as u32
-        + state.tree as u32 * parameters.tree_fire_duration
-}
-
-struct NeighboringCellInfo {
-    trees: u8,
-    fires: u8,
-}
-
-#[inline(always)]
-fn get_neighboring_cell_info(
-    grid: &[CellState],
-    idx: usize,
-    width: usize,
-    height: usize,
-) -> NeighboringCellInfo {
-    let row = idx / width;
-    let col = idx % width;
-
-    // Small lookup table; will be fully inlined and optimized away.
-    const N: [(isize, isize); 8] = [
-        (-1, -1),
-        (-1, 0),
-        (-1, 1),
-        (0, -1),
-        (0, 1),
-        (1, -1),
-        (1, 0),
-        (1, 1),
-    ];
-
-    let mut fires: u8 = 0;
-    let mut trees: u8 = 0;
-
-    for (dr, dc) in N {
-        let nr = row as isize + dr;
-        let nc = col as isize + dc;
-
-        if nr >= 0 && nr < height as isize && nc >= 0 && nc < width as isize {
-            let nidx = nr as usize * width + nc as usize;
-
-            if grid[nidx].burning.burning() {
-                fires += 1;
-            }
-            if grid[nidx].tree {
-                trees += 1;
-            }
-        }
-    }
-
-    NeighboringCellInfo { fires, trees }
 }

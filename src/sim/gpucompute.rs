@@ -1,9 +1,12 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 
 use bytemuck::{Pod, Zeroable};
-use js_sys::Date;
+use watch::WatchSender;
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, Buffer, BufferDescriptor, BufferUsages, ComputePassDescriptor,
     ComputePipeline, ComputePipelineDescriptor, Device, Instance, MapMode,
     PipelineCompilationOptions, PipelineLayoutDescriptor, Queue, ShaderStages,
@@ -31,6 +34,8 @@ pub struct ComputeContext {
     params_buf: Buffer,
     size_bind_group: BindGroup,
     flipped_bufs: bool,
+    time_bind_group: BindGroup,
+    time_buf: Buffer,
     old_params: SimulationParameters,
     queue: Queue,
     pipeline: ComputePipeline,
@@ -38,13 +43,26 @@ pub struct ComputeContext {
     width: usize,
     height: usize,
     staging_buf: Buffer,
-    is_ready: Arc<AtomicBool>,
+    staging_mapped: Arc<AtomicBool>,
+    steps: Arc<AtomicU32>,
+    frame_tx: WatchSender<SimulationFrame>,
+}
+async fn get_adapter() -> Result<Adapter, anyhow::Error> {
+    crate::log("getting instance");
+    let instance = Instance::new(&wgpu::InstanceDescriptor::default());
+    crate::log("getting adapter");
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: true,
+            compatible_surface: None,
+        })
+        .await?;
+    Ok(adapter)
 }
 pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
-    let instance = Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await?;
+    let adapter = get_adapter().await?;
+    crate::log("getting downlevel caps");
     let downlevel_caps = adapter.get_downlevel_capabilities();
     if !downlevel_caps
         .flags
@@ -52,7 +70,8 @@ pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
     {
         return Err(anyhow::anyhow!("adapter does not support compute shaders"));
     }
-    Ok(adapter
+    crate::log("getting device");
+    let device = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("firesim compute device"),
             required_features: wgpu::Features::empty(),
@@ -61,7 +80,9 @@ pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
         })
-        .await?)
+        .await?;
+    crate::log("got device");
+    Ok(device)
 }
 impl ComputeContext {
     pub fn compute_step(&mut self, parameters: SimulationParameters) {
@@ -74,6 +95,11 @@ impl ComputeContext {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("simulation step encoder"),
             });
+        self.queue.write_buffer(
+            &self.time_buf,
+            0,
+            bytemuck::bytes_of(&self.steps.load(Ordering::Relaxed)),
+        );
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("simulation step compute pass"),
@@ -91,28 +117,22 @@ impl ComputeContext {
             );
             pass.set_bind_group(1, &self.params_bind_group, &[]);
             pass.set_bind_group(2, &self.size_bind_group, &[]);
+            pass.set_bind_group(3, &self.time_bind_group, &[]);
             pass.dispatch_workgroups(num_dispatches as u32, 1, 1);
         }
-        let src_buf = if self.flipped_bufs {
-            &self.buf_1
-        } else {
-            &self.buf_2
-        };
-        encoder.copy_buffer_to_buffer(src_buf, 0, &self.staging_buf, 0, src_buf.size());
+        if !self.staging_mapped.load(Ordering::SeqCst) {
+            let src_buf = if self.flipped_bufs {
+                &self.buf_1
+            } else {
+                &self.buf_2
+            };
+            encoder.copy_buffer_to_buffer(src_buf, 0, &self.staging_buf, 0, src_buf.size());
+        }
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        let ready_clone = self.is_ready.clone();
-        ready_clone.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        self.staging_buf
-            .map_async(MapMode::Read, .., move |result| {
-                if result.is_ok() {
-                    ready_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
-
         self.flipped_bufs = !self.flipped_bufs;
+        self.steps.fetch_add(1, Ordering::Relaxed);
     }
     fn update_params(&mut self, new: SimulationParameters) {
         self.old_params = new;
@@ -124,9 +144,11 @@ impl ComputeContext {
         queue: Queue,
         start: SimulationFrame,
         parameters: SimulationParameters,
+        frame_tx: WatchSender<SimulationFrame>,
     ) -> Result<Self, anyhow::Error> {
         let start_data: Vec<_> = start
             .grid
+            .clone()
             .into_iter()
             .map(|i| GpuCell {
                 burning: match i.burning {
@@ -241,6 +263,32 @@ impl ComputeContext {
                 resource: params_buf.as_entire_binding(),
             }],
         });
+        let time_buf = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("time buffer"),
+            contents: &[0, 0, 0, 0],
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+        let time_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("time bind group layout"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let time_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("time bind group"),
+            layout: &time_bg_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: time_buf.as_entire_binding(),
+            }],
+        });
         let size_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("grid size bind group layout"),
             entries: &[BindGroupLayoutEntry {
@@ -269,7 +317,12 @@ impl ComputeContext {
         });
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("simulation pipeline layout"),
-            bind_group_layouts: &[&cells_bg_layout, &params_bg_layout, &size_bg_layout],
+            bind_group_layouts: &[
+                &cells_bg_layout,
+                &params_bg_layout,
+                &size_bg_layout,
+                &time_bg_layout,
+            ],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
@@ -302,36 +355,54 @@ impl ComputeContext {
             width: start.width,
             height: start.height,
             staging_buf,
-            is_ready: Arc::new(AtomicBool::new(false)),
+            staging_mapped: Arc::new(AtomicBool::new(false)),
+            time_bind_group: time_bg,
+            time_buf,
+            steps: Arc::new(AtomicU32::new(0)),
+            frame_tx,
         })
     }
-    pub async fn get_latest(&self) -> SimulationFrame {
-        if self.is_ready.load(std::sync::atomic::Ordering::SeqCst) {
-            let buf_view = self.staging_buf.get_mapped_range(..);
-            let cells: &[GpuCell] = bytemuck::cast_slice(buf_view.as_ref());
-            let frame = SimulationFrame {
-                grid: cells
-                    .iter()
-                    .map(|i| CellState {
-                        burning: if i.burning > 0 {
-                            BurnState::Burning {
-                                ticks_remaining: i.burning,
-                            }
-                        } else {
-                            BurnState::NotBurning
-                        },
-                        underbrush: i.underbrush,
-                        tree: i.tree > 0.0,
-                    })
-                    .collect(),
-                width: self.width,
-                height: self.height,
-            };
-            drop(buf_view);
-            self.staging_buf.unmap();
-            frame
-        } else {
-            SimulationFrame::default()
+    pub fn send_latest(&self) {
+        if !self
+            .staging_mapped
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let tx = self.frame_tx.clone();
+            let buf = self.staging_buf.clone();
+            let width = self.width;
+            let height = self.height;
+            self.staging_mapped.store(true, Ordering::SeqCst);
+            let staging_mapped = Arc::clone(&self.staging_mapped);
+            self.staging_buf.map_async(MapMode::Read, .., move |v| {
+                if v.is_err() {
+                    crate::log("map error");
+                    return;
+                }
+                let buf_view = buf.get_mapped_range(..);
+                let cells: &[GpuCell] = bytemuck::cast_slice(buf_view.as_ref());
+                let frame = SimulationFrame {
+                    grid: cells
+                        .iter()
+                        .map(|i| CellState {
+                            burning: if i.burning > 0 {
+                                BurnState::Burning {
+                                    ticks_remaining: i.burning,
+                                }
+                            } else {
+                                BurnState::NotBurning
+                            },
+                            underbrush: i.underbrush,
+                            tree: i.tree > 0.0,
+                        })
+                        .collect(),
+                    width,
+                    height,
+                };
+                drop(buf_view);
+                buf.unmap();
+                staging_mapped.store(false, Ordering::SeqCst);
+                tx.send(frame);
+            });
         }
     }
 }

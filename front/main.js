@@ -5,7 +5,7 @@
 // will "boot" the module and make it ready to use. Currently browsers
 // don't support natively imported WebAssembly as an ES module, but
 // eventually the manual initialization won't be required!
-import init, { initialize, initThreadPool, start } from './pkg/firesim.js';
+import init, { initialize, start } from './pkg/firesim.js';
 
 var sim = null;
 var currentParams = null;
@@ -43,7 +43,7 @@ function resizeCanvas(canvas) {
 
 async function run() {
   await init();
-  await initThreadPool(navigator.hardwareConcurrency);
+  // await initThreadPool(navigator.hardwareConcurrency);
   await initialize();
   let canvas = document.getElementById("sim-surface");
   resizeCanvas(canvas);
