@@ -284,16 +284,6 @@ impl Simulation {
     }
 }
 
-#[wasm_bindgen(module = "/js/secure-context.js")]
-extern "C" {
-    fn is_secure_context() -> bool;
-}
-
-#[wasm_bindgen(module = "/js/testing.js")]
-extern "C" {
-    async fn js_tests();
-}
-
 fn sim_thread(
     mut parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,

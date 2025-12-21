@@ -6,7 +6,10 @@ use crate::{
 };
 use js_sys::Uint8ClampedArray;
 use wasm_bindgen::prelude::*;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageBitmap, ImageData, Window};
+use web_sys::{
+    CanvasRenderingContext2d, DedicatedWorkerGlobalScope, HtmlCanvasElement, ImageBitmap,
+    ImageData, Window,
+};
 
 pub mod rendering;
 pub mod sim;
@@ -22,6 +25,19 @@ struct CanvasRenderSurface {
 extern "C" {
     #[wasm_bindgen(js_namespace = console)]
     fn log(s: &str);
+}
+
+#[wasm_bindgen]
+pub fn worker_entry(ptr: u32) -> Result<(), JsValue> {
+    let ptr = unsafe { Box::from_raw(ptr as *mut Work) };
+    let global = js_sys::global().unchecked_into::<DedicatedWorkerGlobalScope>();
+    (ptr.func)();
+    global.post_message(&JsValue::undefined())?;
+    Ok(())
+}
+
+struct Work {
+    func: Box<dyn FnOnce() + Send>,
 }
 
 impl RenderSurface for CanvasRenderSurface {
