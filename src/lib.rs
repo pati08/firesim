@@ -1,14 +1,22 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use crate::{
     rendering::{RenderMode, RenderSection, RenderState, RenderSurface, RenderSurfaceSize, render},
-    sim::{ConfigurableParameters, Simulation, SimulationFrame, spawn_simulation},
+    sim::{
+        ConfigurableParameters, Simulation, SimulationFrame, SimulationStatistics, spawn_simulation,
+    },
 };
-use js_sys::Uint8ClampedArray;
+use futures_intrusive::channel::shared::OneshotSender;
+use js_sys::{Date, Uint8ClampedArray};
 use wasm_bindgen::prelude::*;
+use watch::{WatchReceiver, WatchSender};
 use web_sys::{
     CanvasRenderingContext2d, DedicatedWorkerGlobalScope, HtmlCanvasElement, ImageBitmap,
-    ImageData, Window,
+    ImageData, Window, Worker, WorkerOptions,
 };
 
 pub mod rendering;
@@ -29,15 +37,43 @@ extern "C" {
 
 #[wasm_bindgen]
 pub fn worker_entry(ptr: u32) -> Result<(), JsValue> {
-    let ptr = unsafe { Box::from_raw(ptr as *mut Work) };
+    let ptr = unsafe { Box::from_raw(ptr as *mut SimWorkerArgs) };
     let global = js_sys::global().unchecked_into::<DedicatedWorkerGlobalScope>();
-    (ptr.func)();
+    wasm_bindgen_futures::spawn_local(async move {
+        sim::sim_thread(
+            ptr.parameters_rx,
+            ptr.stop,
+            ptr.latest_frame_tx,
+            ptr.latest_frame_rx,
+            ptr.stats_tx,
+            ptr.wants_new_frame,
+        )
+        .await;
+    });
     global.post_message(&JsValue::undefined())?;
     Ok(())
 }
 
-struct Work {
-    func: Box<dyn FnOnce() + Send>,
+fn spawn_sim_worker(args: SimWorkerArgs) -> Result<(), JsValue> {
+    let opts = WorkerOptions::new();
+    opts.set_type(web_sys::WorkerType::Module);
+    let worker = Worker::new_with_options("worker.js", &opts)?;
+    let array = js_sys::Array::new();
+    array.push(&wasm_bindgen::module());
+    array.push(&wasm_bindgen::memory());
+    worker.post_message(&array)?;
+    let work = Box::new(args);
+    let ptr = Box::into_raw(work);
+    worker.post_message(&JsValue::from(ptr as u32))?;
+    Ok(())
+}
+struct SimWorkerArgs {
+    parameters_rx: WatchReceiver<ConfigurableParameters>,
+    stop: Arc<AtomicBool>,
+    latest_frame_tx: WatchSender<SimulationFrame>,
+    latest_frame_rx: WatchReceiver<SimulationFrame>,
+    stats_tx: OneshotSender<SimulationStatistics>,
+    wants_new_frame: Arc<AtomicBool>,
 }
 
 impl RenderSurface for CanvasRenderSurface {
@@ -120,12 +156,14 @@ pub fn start() -> Simulation {
 
     // 2. Store the Closure object directly.
     *g.borrow_mut() = Some(Closure::new(move || {
+        let start = Date::now();
         let frame = s2.get_latest_frame();
         let state = RenderState::Singular(RenderSection {
             sim_frame: &frame,
             mode: RenderMode::Standard,
         });
         render(&state, &mut render_surface);
+        crate::log(&format!("rendering took ~{}", Date::now() - start));
 
         let window = web_sys::window().expect("failed to get window");
 

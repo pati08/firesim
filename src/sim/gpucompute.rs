@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
@@ -48,9 +48,7 @@ pub struct ComputeContext {
     frame_tx: WatchSender<SimulationFrame>,
 }
 async fn get_adapter() -> Result<Adapter, anyhow::Error> {
-    crate::log("getting instance");
     let instance = Instance::new(&wgpu::InstanceDescriptor::default());
-    crate::log("getting adapter");
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -62,7 +60,6 @@ async fn get_adapter() -> Result<Adapter, anyhow::Error> {
 }
 pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
     let adapter = get_adapter().await?;
-    crate::log("getting downlevel caps");
     let downlevel_caps = adapter.get_downlevel_capabilities();
     if !downlevel_caps
         .flags
@@ -70,7 +67,6 @@ pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
     {
         return Err(anyhow::anyhow!("adapter does not support compute shaders"));
     }
-    crate::log("getting device");
     let device = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("firesim compute device"),
@@ -81,7 +77,6 @@ pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
             trace: wgpu::Trace::Off,
         })
         .await?;
-    crate::log("got device");
     Ok(device)
 }
 impl ComputeContext {

@@ -3,14 +3,15 @@ use futures_intrusive::channel::shared::{OneshotReceiver, OneshotSender};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use wasm_bindgen::prelude::*;
 use watch::{WatchReceiver, WatchSender};
 
-mod gpucompute;
+pub mod gpucompute;
 
 use js_sys::Date;
+
+use crate::spawn_sim_worker;
 
 #[derive(Clone)]
 pub struct SimulationFrame {
@@ -237,12 +238,15 @@ pub fn spawn_simulation(
     let p = parameters_rx.clone();
     let (stats_tx, stats_rx) = futures_intrusive::channel::shared::oneshot_channel();
     let lf_rx = latest_frame_rx.clone();
-    let (stx, srx) = mpsc::channel();
-    wasm_thread::spawn(move || {
-        srx.recv().unwrap();
-        sim_thread(p, s, latest_frame_tx, lf_rx, stats_tx, wnf)
-    });
-    stx.send(()).unwrap();
+    spawn_sim_worker(crate::SimWorkerArgs {
+        parameters_rx: p,
+        stop: s,
+        latest_frame_tx,
+        latest_frame_rx: lf_rx,
+        stats_tx,
+        wants_new_frame: wnf,
+    })
+    .unwrap();
     let stats_rx = Arc::new(Mutex::new(stats_rx));
     Simulation {
         parameters_tx,
@@ -284,7 +288,7 @@ impl Simulation {
     }
 }
 
-fn sim_thread(
+pub async fn sim_thread(
     mut parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,
     latest_frame_tx: WatchSender<SimulationFrame>,
@@ -292,10 +296,7 @@ fn sim_thread(
     stats_tx: OneshotSender<SimulationStatistics>,
     wants_new_frame: Arc<AtomicBool>,
 ) {
-    // let is_secure_context = is_secure_context();
-    // pollster::block_on(js_tests());
-    // crate::log(&format!("secure context: {is_secure_context}"));
-    let (device, queue) = pollster::block_on(gpucompute::create_device()).unwrap();
+    let (device, queue) = gpucompute::create_device().await.unwrap();
     let mut end_of_last_step = Date::now();
     let mut total_iterations = 0;
     let mut total_time = 0.0;
@@ -324,12 +325,7 @@ fn sim_thread(
         let to_wait =
             (parameters.tick_rate as f64).recip() * 1000.0 - (Date::now() - end_of_last_step);
         if to_wait > 0.0 {
-            crate::log(&format!("sleeping for {}", to_wait));
-            let sleep_start = Date::now();
-            while !(Date::now() - sleep_start >= to_wait) {
-                std::thread::yield_now();
-            }
-            crate::log(&format!("slept for {}", Date::now() - sleep_start));
+            gloo_timers::future::TimeoutFuture::new(to_wait as u32).await;
         }
         end_of_last_step = Date::now();
     }
