@@ -1,32 +1,105 @@
+#![feature(if_let_guard)]
 use std::{
     cell::RefCell,
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
+    time::SystemTime,
 };
 
 use crate::{
     rendering::{RenderMode, RenderSection, RenderState, RenderSurface, RenderSurfaceSize, render},
     sim::{
-        ConfigurableParameters, Simulation, SimulationFrame, SimulationStatistics, spawn_simulation,
+        ConfigurableParameters, SimulationFrame, SimulationHandle, SimulationStatistics,
+        spawn_simulation,
     },
 };
 use futures_intrusive::channel::shared::OneshotSender;
-use js_sys::{Date, Uint8ClampedArray};
 use wasm_bindgen::prelude::*;
 use watch::{WatchReceiver, WatchSender};
 use web_sys::{
     CanvasRenderingContext2d, DedicatedWorkerGlobalScope, HtmlCanvasElement, ImageBitmap,
     ImageData, Window, Worker, WorkerOptions,
 };
+use winit::{
+    event::WindowEvent,
+    event_loop::{EventLoop, EventLoopProxy},
+    platform::web::WindowAttributesExtWebSys,
+    window::WindowAttributes,
+};
 
 pub mod rendering;
 pub mod sim;
 pub mod util;
 
-struct CanvasRenderSurface {
-    window: Window,
-    canvas_rendering_context: CanvasRenderingContext2d,
-    canvas: HtmlCanvasElement,
+struct Application {
+    simulation: SimulationHandle,
+    proxy: Option<EventLoopProxy<RenderState>>,
+    render_state: Option<RenderState>,
+}
+
+impl Application {
+    fn new(event_loop: &EventLoop<RenderState>) -> Self {
+        const SIM_WIDTH: usize = 500;
+        const SIM_HEIGHT: usize = 500;
+
+        let start_frame = SimulationFrame::new(SIM_WIDTH, SIM_HEIGHT);
+        let sim_params = ConfigurableParameters::realistic(SIM_WIDTH, SIM_HEIGHT, 2.0, 36.0);
+        let sim = spawn_simulation(start_frame, sim_params);
+        Self {
+            simulation: sim,
+            proxy: Some(event_loop.create_proxy()),
+            render_state: None,
+        }
+    }
+}
+
+impl winit::application::ApplicationHandler<RenderState> for Application {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.render_state.is_some() {
+            return;
+        }
+
+        let dom_window = web_sys::window().expect("could not get window");
+        let canvas: HtmlCanvasElement = dom_window
+            .document()
+            .expect("could not get document")
+            .get_element_by_id("sim-surface")
+            .expect("could not get element with id `sim-surface` as required")
+            .dyn_into()
+            .expect("`sim-surface` is not a canvas");
+        match event_loop.create_window(WindowAttributes::default().with_canvas(Some(canvas))) {
+            Ok(window) => {
+                if let Some(proxy) = self.proxy.take() {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let state = RenderState::new(Arc::new(window)).await;
+                        assert!(proxy.send_event(state).is_ok());
+                    });
+                    // Some(RenderState::new(Arc::new(window)))
+                }
+            }
+            Err(e) => log::error!("failed to create window: {e}"),
+        };
+    }
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => self.render_state = None,
+            WindowEvent::RedrawRequested if let Some(ref mut state) = self.render_state => {
+                state.redraw()
+            }
+            _ => (),
+        };
+    }
+    fn user_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        mut event: RenderState,
+    ) {
+    }
 }
 
 #[wasm_bindgen]
@@ -76,39 +149,6 @@ struct SimWorkerArgs {
     wants_new_frame: Arc<AtomicBool>,
 }
 
-impl RenderSurface for CanvasRenderSurface {
-    fn query_size(&self) -> crate::rendering::RenderSurfaceSize {
-        RenderSurfaceSize {
-            w_px: self.canvas.width() as usize,
-            h_px: self.canvas.height() as usize,
-        }
-    }
-    fn present_frame(&mut self, frame: Vec<u32>) {
-        let bitmap: Vec<u8> = frame
-            .into_iter()
-            .flat_map(|i| [(i >> 16) as u8, (i >> 8) as u8, i as u8, u8::MAX].into_iter())
-            .collect();
-        let bitmap = Uint8ClampedArray::new_from_slice(&bitmap[..]);
-        let image_data = ImageData::new_with_js_u8_clamped_array(&bitmap, self.canvas.width())
-            .expect("could not construct ImageData");
-        let rendering_context = self.canvas_rendering_context.clone();
-        let closure = Closure::once(move |data: JsValue| {
-            let image_bitmap: ImageBitmap = data
-                .dyn_into()
-                .expect("failed to cast JsValue into ImageBitmap");
-            rendering_context
-                .draw_image_with_image_bitmap(&image_bitmap, 0.0, 0.0)
-                .expect("failed to draw ");
-        });
-        let _ = self
-            .window
-            .create_image_bitmap_with_image_data(&image_data)
-            .expect("failed to create image bitmap")
-            .then(&closure);
-        closure.forget();
-    }
-}
-
 #[wasm_bindgen(start)]
 pub fn initialize() {
     console_error_panic_hook::set_once();
@@ -118,68 +158,84 @@ pub fn initialize() {
 // Assuming SimulationFrame, ConfigurableParameters, RenderState, RenderSection,
 // RenderMode, CanvasRenderSurface, render, and spawn_simulation are defined.
 
-#[wasm_bindgen]
-pub fn start() -> Simulation {
-    let window = web_sys::window().expect("could not get window");
-    let canvas: HtmlCanvasElement = window
-        .document()
-        .expect("could not get document")
-        .get_element_by_id("sim-surface")
-        .expect("could not get element with id `sim-surface` as required")
-        .dyn_into()
-        .expect("`sim-surface` is not a canvas");
-    let context: CanvasRenderingContext2d = canvas
-        .get_context("2d")
-        .expect("failed to get context")
-        .expect("no 2d context")
-        .dyn_into()
-        .expect(r#"could not cast the result of calling `canvas.getContext("2d")` into a CanvasRenderingContext2d object"#);
-    let mut render_surface = CanvasRenderSurface {
-        canvas_rendering_context: context,
-        canvas,
-        window: window.clone(),
-    };
-
-    const SIM_WIDTH: usize = 500;
-    const SIM_HEIGHT: usize = 500;
-
-    let start_frame = SimulationFrame::new(SIM_WIDTH, SIM_HEIGHT);
-    let sim_params = ConfigurableParameters::realistic(SIM_WIDTH, SIM_HEIGHT, 2.0, 36.0);
-    let sim = spawn_simulation(start_frame, sim_params);
-
-    type RAFClosure = Closure<dyn FnMut()>;
-
-    let f: Rc<RefCell<Option<RAFClosure>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-
-    let mut s2 = sim.clone();
-
-    // 2. Store the Closure object directly.
-    *g.borrow_mut() = Some(Closure::new(move || {
-        let start = Date::now();
-        let frame = s2.get_latest_frame();
-        let state = RenderState::Singular(RenderSection {
-            sim_frame: &frame,
-            mode: RenderMode::Standard,
-        });
-        render(&state, &mut render_surface);
-        crate::log(&format!("rendering took ~{}", Date::now() - start));
-
-        let window = web_sys::window().expect("failed to get window");
-
-        // 3. To schedule the next frame, borrow the closure from 'f',
-        //    get its JsValue reference, and pass it to request_animation_frame.
-        window
-            .request_animation_frame(f.borrow().as_ref().unwrap().as_ref().unchecked_ref())
-            .expect("failed to request animation frame");
-    }));
-
-    // 4. Start the loop. Borrow the closure from 'g' and pass its JsValue reference.
-    window
-        .request_animation_frame(g.borrow().as_ref().unwrap().as_ref().unchecked_ref())
-        .expect("failed to request animation frame");
-
-    // --- FIX END ---
-
-    sim
-}
+// #[wasm_bindgen]
+// pub fn start() -> SimulationHandle {
+//     let _ = fern::Dispatch::new()
+//         .format(|out, message, record| {
+//             out.finish(format_args!(
+//                 "[{} {} {} {}",
+//                 humantime::format_rfc3339_seconds(
+//                     SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(Date::now() as u64)
+//                 ),
+//                 record.level(),
+//                 record.target(),
+//                 message
+//             ))
+//         })
+//         .level(log::LevelFilter::Debug)
+//         .chain(fern::Output::call(console_log::log))
+//         .apply()
+//         .inspect_err(|e| crate::log(&format!("failed to initialize logger: {e}")));
+//     let window = web_sys::window().expect("could not get window");
+//     let canvas: HtmlCanvasElement = window
+//         .document()
+//         .expect("could not get document")
+//         .get_element_by_id("sim-surface")
+//         .expect("could not get element with id `sim-surface` as required")
+//         .dyn_into()
+//         .expect("`sim-surface` is not a canvas");
+//     let context: CanvasRenderingContext2d = canvas
+//         .get_context("2d")
+//         .expect("failed to get context")
+//         .expect("no 2d context")
+//         .dyn_into()
+//         .expect(r#"could not cast the result of calling `canvas.getContext("2d")` into a CanvasRenderingContext2d object"#);
+//     let mut render_surface = CanvasRenderSurface {
+//         canvas_rendering_context: context,
+//         canvas,
+//         window: window.clone(),
+//     };
+//
+//     const SIM_WIDTH: usize = 500;
+//     const SIM_HEIGHT: usize = 500;
+//
+//     let start_frame = SimulationFrame::new(SIM_WIDTH, SIM_HEIGHT);
+//     let sim_params = ConfigurableParameters::realistic(SIM_WIDTH, SIM_HEIGHT, 2.0, 36.0);
+//     let sim = spawn_simulation(start_frame, sim_params);
+//
+//     type RAFClosure = Closure<dyn FnMut()>;
+//
+//     let f: Rc<RefCell<Option<RAFClosure>>> = Rc::new(RefCell::new(None));
+//     let g = f.clone();
+//
+//     let mut s2 = sim.clone();
+//
+//     // 2. Store the Closure object directly.
+//     *g.borrow_mut() = Some(Closure::new(move || {
+//         let start = Date::now();
+//         let frame = s2.get_latest_frame();
+//         let state = RenderState::Singular(RenderSection {
+//             sim_frame: &frame,
+//             mode: RenderMode::Standard,
+//         });
+//         render(&state, &mut render_surface);
+//         log::info!("rendering took ~{}", Date::now() - start);
+//
+//         let window = web_sys::window().expect("failed to get window");
+//
+//         // 3. To schedule the next frame, borrow the closure from 'f',
+//         //    get its JsValue reference, and pass it to request_animation_frame.
+//         window
+//             .request_animation_frame(f.borrow().as_ref().unwrap().as_ref().unchecked_ref())
+//             .expect("failed to request animation frame");
+//     }));
+//
+//     // 4. Start the loop. Borrow the closure from 'g' and pass its JsValue reference.
+//     window
+//         .request_animation_frame(g.borrow().as_ref().unwrap().as_ref().unchecked_ref())
+//         .expect("failed to request animation frame");
+//
+//     // --- FIX END ---
+//
+//     sim
+// }

@@ -370,7 +370,7 @@ impl ComputeContext {
             let staging_mapped = Arc::clone(&self.staging_mapped);
             self.staging_buf.map_async(MapMode::Read, .., move |v| {
                 if v.is_err() {
-                    crate::log("map error");
+                    log::error!("map error");
                     return;
                 }
                 let buf_view = buf.get_mapped_range(..);

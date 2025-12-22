@@ -216,7 +216,7 @@ pub struct SimulationStatistics {
 
 #[wasm_bindgen]
 #[derive(Clone)]
-pub struct Simulation {
+pub struct SimulationHandle {
     parameters_tx: WatchSender<ConfigurableParameters>,
     parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,
@@ -228,7 +228,7 @@ pub struct Simulation {
 pub fn spawn_simulation(
     start_frame: SimulationFrame,
     parameters: ConfigurableParameters,
-) -> Simulation {
+) -> SimulationHandle {
     let (parameters_tx, parameters_rx) = watch::channel(parameters);
     let stop = Arc::new(AtomicBool::new(false));
     let wants_new_frame = Arc::new(AtomicBool::new(false));
@@ -248,7 +248,7 @@ pub fn spawn_simulation(
     })
     .unwrap();
     let stats_rx = Arc::new(Mutex::new(stats_rx));
-    Simulation {
+    SimulationHandle {
         parameters_tx,
         parameters_rx,
         stop,
@@ -258,7 +258,7 @@ pub fn spawn_simulation(
     }
 }
 
-impl Simulation {
+impl SimulationHandle {
     /// Get the latest completed simulation frame.
     pub fn get_latest_frame(&mut self) -> SimulationFrame {
         self.wants_new_frame.store(true, Ordering::Relaxed);
@@ -267,11 +267,11 @@ impl Simulation {
 }
 
 #[wasm_bindgen]
-impl Simulation {
+impl SimulationHandle {
     #[wasm_bindgen]
     pub async fn stop(self) -> Option<SimulationStatistics> {
         self.stop.store(true, Ordering::Relaxed);
-        crate::log("stopping");
+        log::info!("stopping");
         self.stats_rx
             .lock()
             .expect("failed to get stats rx lock")
