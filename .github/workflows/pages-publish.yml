@@ -27,6 +27,8 @@ jobs:
           toolchain: nightly
           profile: minimal
           override: true
+          target: wasm32-unknown-unknown
+          components: rust-src
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
