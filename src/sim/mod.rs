@@ -198,7 +198,7 @@ impl From<&ConfigurableParameters> for SimulationParameters {
             tree_growth_rate,
             tree_death_rate,
             underbrush_tree_growth_hindrance: config.underbrush_tree_growth_hindrance,
-            tree_underbrush_generation: config.tree_underbrush_generation / ticks_per_year * 24.0,
+            tree_underbrush_generation: config.tree_underbrush_generation / ticks_per_year,
             tree_death_underbrush: config.tree_death_underbrush,
             tree_fire_duration: config.tree_fire_duration,
             underbrush_fire_duration: config.underbrush_fire_duration,
