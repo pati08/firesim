@@ -11,7 +11,6 @@ use crate::{
 use futures_intrusive::channel::shared::OneshotSender;
 use wasm_bindgen::prelude::*;
 use watch::{WatchReceiver, WatchSender};
-#[cfg(target_arch = "wasm32")]
 use web_sys::HtmlCanvasElement;
 use web_sys::{DedicatedWorkerGlobalScope, Worker, WorkerOptions};
 use winit::{
@@ -20,7 +19,6 @@ use winit::{
     window::WindowAttributes,
 };
 
-#[cfg(target_arch = "wasm32")]
 use winit::platform::web::WindowAttributesExtWebSys;
 
 pub mod gpu;
@@ -65,7 +63,6 @@ impl Application {
     }
 
     /// Process any pending control messages from JavaScript
-    #[cfg(target_arch = "wasm32")]
     fn process_control_messages(&mut self) {
         CONTROL_QUEUE.with(|queue| {
             let messages: Vec<_> = queue.borrow_mut().drain(..).collect();
@@ -105,74 +102,39 @@ impl winit::application::ApplicationHandler<GpuMessage> for Application {
             return;
         }
 
-        #[cfg(target_arch = "wasm32")]
-        {
-            let dom_window = web_sys::window().expect("could not get window");
-            let canvas: HtmlCanvasElement = dom_window
-                .document()
-                .expect("could not get document")
-                .get_element_by_id("sim-surface")
-                .expect("could not get element with id `sim-surface` as required")
-                .dyn_into()
-                .expect("`sim-surface` is not a canvas");
-            let window_attrs = WindowAttributes::default().with_canvas(Some(canvas));
-            match event_loop.create_window(window_attrs) {
-                Ok(window) => {
-                    if let Some(proxy) = self.proxy.take() {
-                        let window = Arc::new(window);
-                        let config = self.config_params.clone();
-                        let sim_params = SimulationParameters::from(&config);
-                        let start_frame =
-                            SimulationFrame::new(config.forest_width, config.forest_height);
+        let dom_window = web_sys::window().expect("could not get window");
+        let canvas: HtmlCanvasElement = dom_window
+            .document()
+            .expect("could not get document")
+            .get_element_by_id("sim-surface")
+            .expect("could not get element with id `sim-surface` as required")
+            .dyn_into()
+            .expect("`sim-surface` is not a canvas");
+        let window_attrs = WindowAttributes::default().with_canvas(Some(canvas));
+        match event_loop.create_window(window_attrs) {
+            Ok(window) => {
+                if let Some(proxy) = self.proxy.take() {
+                    let window = Arc::new(window);
+                    let config = self.config_params.clone();
+                    let sim_params = SimulationParameters::from(&config);
+                    let start_frame =
+                        SimulationFrame::new(config.forest_width, config.forest_height);
 
-                        wasm_bindgen_futures::spawn_local(async move {
-                            match GpuSimRenderer::new(window, start_frame, sim_params).await {
-                                Ok(renderer) => {
-                                    let _ = proxy.send_event(GpuMessage::Initialized(renderer));
-                                }
-                                Err(e) => {
-                                    // Error will be logged in user_event handler
-                                    let _ = proxy.send_event(GpuMessage::Error(e.to_string()));
-                                }
-                            }
-                        });
-                    }
-                }
-                Err(e) => log::error!("failed to create window: {e}"),
-            };
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            match event_loop.create_window(WindowAttributes::default()) {
-                Ok(window) => {
-                    if let Some(proxy) = self.proxy.take() {
-                        let window = Arc::new(window);
-                        let config = self.config_params.clone();
-                        let sim_params = SimulationParameters::from(&config);
-                        let start_frame =
-                            SimulationFrame::new(config.forest_width, config.forest_height);
-
-                        // On native, use pollster to block on the future
-                        let renderer_result = pollster::block_on(GpuSimRenderer::new(
-                            window,
-                            start_frame,
-                            sim_params,
-                        ));
-                        match renderer_result {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match GpuSimRenderer::new(window, start_frame, sim_params).await {
                             Ok(renderer) => {
                                 let _ = proxy.send_event(GpuMessage::Initialized(renderer));
                             }
                             Err(e) => {
-                                log::error!("Failed to create GPU renderer: {e}");
+                                // Error will be logged in user_event handler
                                 let _ = proxy.send_event(GpuMessage::Error(e.to_string()));
                             }
                         }
-                    }
+                    });
                 }
-                Err(e) => log::error!("failed to create window: {e}"),
-            };
-        }
+            }
+            Err(e) => log::error!("failed to create window: {e}"),
+        };
     }
 
     fn window_event(
@@ -192,7 +154,6 @@ impl winit::application::ApplicationHandler<GpuMessage> for Application {
             }
             WindowEvent::RedrawRequested => {
                 // Process any pending control messages from JavaScript
-                #[cfg(target_arch = "wasm32")]
                 self.process_control_messages();
 
                 if let Some(ref mut renderer) = self.gpu_renderer {
@@ -363,7 +324,6 @@ pub fn initialize() {
 }
 
 /// Control message for the simulation (simple enum without heavy types)
-#[cfg(target_arch = "wasm32")]
 #[derive(Clone)]
 enum ControlMessage {
     TogglePause,
@@ -373,18 +333,15 @@ enum ControlMessage {
 }
 
 // Thread-local storage for control messages (WASM is single-threaded)
-#[cfg(target_arch = "wasm32")]
 thread_local! {
     static CONTROL_QUEUE: std::cell::RefCell<Vec<ControlMessage>> = std::cell::RefCell::new(Vec::new());
     static PARAMS_STORE: std::cell::RefCell<Option<ConfigurableParameters>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Controller for the running simulation
-#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct SimulationController;
 
-#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl SimulationController {
     /// Toggle pause state
@@ -515,30 +472,18 @@ pub fn start() {
     let mut app = Application::new(&event_loop);
 
     // Store initial parameters for controller access
-    #[cfg(target_arch = "wasm32")]
-    {
-        PARAMS_STORE.with(|store| {
-            *store.borrow_mut() = Some(app.config_params.clone());
-        });
-    }
+    PARAMS_STORE.with(|store| {
+        *store.borrow_mut() = Some(app.config_params.clone());
+    });
 
     // On web, we need to spawn the event loop
-    #[cfg(target_arch = "wasm32")]
-    {
-        use winit::platform::web::EventLoopExtWebSys;
-        event_loop.spawn_app(app);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        event_loop.run_app(&mut app).expect("Event loop error");
-    }
+    use winit::platform::web::EventLoopExtWebSys;
+    event_loop.spawn_app(app);
 }
 
 /// Standalone GPU simulation and renderer for more control
 ///
 /// Use this when you want to manage the render loop yourself
-#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct GpuSimulation {
     renderer: GpuSimRenderer,
@@ -547,53 +492,8 @@ pub struct GpuSimulation {
     stopped: bool,
 }
 
-#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl GpuSimulation {
-    /// Create a new GPU simulation from a canvas element ID
-    #[wasm_bindgen]
-    pub async fn create(canvas_id: &str) -> Result<GpuSimulation, JsValue> {
-        use winit::platform::web::WindowAttributesExtWebSys;
-
-        const SIM_WIDTH: usize = 500;
-        const SIM_HEIGHT: usize = 500;
-
-        let config_params = ConfigurableParameters::realistic(SIM_WIDTH, SIM_HEIGHT, 2.0, 36.0);
-        let sim_params = SimulationParameters::from(&config_params);
-        let start_frame = SimulationFrame::new(SIM_WIDTH, SIM_HEIGHT);
-
-        let dom_window = web_sys::window().ok_or("No window")?;
-        let canvas: HtmlCanvasElement = dom_window
-            .document()
-            .ok_or("No document")?
-            .get_element_by_id(canvas_id)
-            .ok_or("Canvas not found")?
-            .dyn_into()
-            .map_err(|_| "Element is not a canvas")?;
-
-        // Create a minimal event loop just to get a window
-        let event_loop = winit::event_loop::EventLoop::<()>::new()
-            .map_err(|e| format!("Failed to create event loop: {e}"))?;
-
-        #[allow(deprecated)]
-        let window = event_loop
-            .create_window(WindowAttributes::default().with_canvas(Some(canvas)))
-            .map_err(|e| format!("Failed to create window: {e}"))?;
-
-        let window = Arc::new(window);
-
-        let renderer = GpuSimRenderer::new(window, start_frame, sim_params)
-            .await
-            .map_err(|e| format!("Failed to create renderer: {e}"))?;
-
-        Ok(Self {
-            renderer,
-            config_params,
-            paused: false,
-            stopped: false,
-        })
-    }
-
     /// Run one simulation step and render the result
     #[wasm_bindgen]
     pub fn step_and_render(&mut self) -> Result<(), JsValue> {

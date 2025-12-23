@@ -1,25 +1,24 @@
 //! Integrated GPU context that manages both compute simulation and rendering
-//! 
+//!
 //! This module provides `GpuSimRenderer` which combines the compute shader simulation
 //! with GPU-accelerated rendering, sharing the same device, queue, and cell buffers.
 
 use std::sync::Arc;
 
-#[cfg(target_arch = "wasm32")]
 use js_sys::Date;
 
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, Buffer, BufferUsages, CommandEncoderDescriptor, Device,
-    FragmentState, Instance, LoadOp, MultisampleState, Operations, PipelineLayoutDescriptor,
-    PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, ShaderStages, StoreOp, Surface, SurfaceConfiguration,
-    TextureUsages, TextureViewDescriptor, VertexState,
+    BindGroupLayoutEntry, Buffer, BufferUsages, CommandEncoderDescriptor, Device, FragmentState,
+    Instance, LoadOp, MultisampleState, Operations, PipelineLayoutDescriptor, PrimitiveState,
+    Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, ShaderStages, StoreOp, Surface, SurfaceConfiguration, TextureUsages,
+    TextureViewDescriptor, VertexState,
     util::{BufferInitDescriptor, DeviceExt},
 };
 use winit::window::Window;
 
-use crate::sim::{gpucompute::GpuCell, BurnState, SimulationFrame, SimulationParameters};
+use crate::sim::{BurnState, SimulationFrame, SimulationParameters, gpucompute::GpuCell};
 
 /// Integrated GPU context for simulation and rendering
 ///
@@ -79,7 +78,7 @@ struct RenderContextIntegrated {
 
 impl GpuSimRenderer {
     /// Create a new integrated GPU context
-    /// 
+    ///
     /// # Arguments
     /// * `window` - The window to render to
     /// * `start` - Initial simulation frame
@@ -90,10 +89,10 @@ impl GpuSimRenderer {
         parameters: SimulationParameters,
     ) -> Result<Self, anyhow::Error> {
         let instance = Instance::new(&wgpu::InstanceDescriptor::default());
-        
+
         // Create surface first to find compatible adapter
         let surface = instance.create_surface(window.clone())?;
-        
+
         // Request adapter compatible with surface
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -107,7 +106,10 @@ impl GpuSimRenderer {
 
         // Verify compute shader support
         let downlevel_caps = adapter.get_downlevel_capabilities();
-        if !downlevel_caps.flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS) {
+        if !downlevel_caps
+            .flags
+            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        {
             return Err(anyhow::anyhow!("adapter does not support compute shaders"));
         }
 
@@ -557,11 +559,8 @@ impl GpuSimRenderer {
         // Update parameters if changed
         if parameters != self.compute.old_params {
             self.compute.old_params = parameters;
-            self.queue.write_buffer(
-                &self.compute.params_buf,
-                0,
-                bytemuck::bytes_of(&parameters),
-            );
+            self.queue
+                .write_buffer(&self.compute.params_buf, 0, bytemuck::bytes_of(&parameters));
         }
 
         // Update time
@@ -572,10 +571,12 @@ impl GpuSimRenderer {
         );
 
         let num_dispatches = (self.width * self.height).div_ceil(64) as u32;
-        
-        let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("compute encoder"),
-        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("compute encoder"),
+            });
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -607,18 +608,7 @@ impl GpuSimRenderer {
 
     /// Get current time in milliseconds
     fn now() -> f64 {
-        #[cfg(target_arch = "wasm32")]
-        {
-            Date::now()
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64() * 1000.0
-        }
+        Date::now()
     }
 
     /// Execute compute steps based on elapsed time and render
@@ -690,22 +680,23 @@ impl GpuSimRenderer {
         // Update parameters if changed
         if parameters != self.compute.old_params {
             self.compute.old_params = parameters;
-            self.queue.write_buffer(
-                &self.compute.params_buf,
-                0,
-                bytemuck::bytes_of(&parameters),
-            );
+            self.queue
+                .write_buffer(&self.compute.params_buf, 0, bytemuck::bytes_of(&parameters));
         }
 
         let num_dispatches = (self.width * self.height).div_ceil(64) as u32;
-        
+
         // Get surface texture
         let output = self.render.surface.get_current_texture()?;
-        let view = output.texture.create_view(&TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&TextureViewDescriptor::default());
 
-        let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("compute and render encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("compute and render encoder"),
+            });
 
         // Run multiple compute passes if needed
         // Each step must be submitted separately so the time_buf write takes effect
@@ -777,7 +768,7 @@ impl GpuSimRenderer {
             });
 
             render_pass.set_pipeline(&self.render.render_pipeline);
-            
+
             // Read from the current output buffer (after all compute passes)
             // flipped_bufs now reflects the final state after all steps
             let cells_bind_group = if self.compute.flipped_bufs {
@@ -785,7 +776,7 @@ impl GpuSimRenderer {
             } else {
                 &self.render.cells_bind_group_1 // buf_1 has latest
             };
-            
+
             render_pass.set_bind_group(0, cells_bind_group, &[]);
             render_pass.set_bind_group(1, &self.render.size_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
@@ -800,11 +791,15 @@ impl GpuSimRenderer {
     /// Render the current simulation state without advancing the simulation
     pub fn render(&self) -> Result<(), wgpu::SurfaceError> {
         let output = self.render.surface.get_current_texture()?;
-        let view = output.texture.create_view(&TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&TextureViewDescriptor::default());
 
-        let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("render encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("render encoder"),
+            });
 
         {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -829,7 +824,7 @@ impl GpuSimRenderer {
             });
 
             render_pass.set_pipeline(&self.render.render_pipeline);
-            
+
             // Read from the current output buffer
             // After step_and_render flips the flag:
             // - If flipped_bufs == true: last compute was buf1→buf2, so buf2 has latest
@@ -839,7 +834,7 @@ impl GpuSimRenderer {
             } else {
                 &self.render.cells_bind_group_1 // buf_1 has latest
             };
-            
+
             render_pass.set_bind_group(0, cells_bind_group, &[]);
             render_pass.set_bind_group(1, &self.render.size_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
@@ -856,7 +851,9 @@ impl GpuSimRenderer {
         if width > 0 && height > 0 {
             self.render.surface_config.width = width;
             self.render.surface_config.height = height;
-            self.render.surface.configure(&self.device, &self.render.surface_config);
+            self.render
+                .surface
+                .configure(&self.device, &self.render.surface_config);
         }
     }
 
