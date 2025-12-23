@@ -9,6 +9,8 @@ use watch::{WatchReceiver, WatchSender};
 
 pub mod gpucompute;
 
+pub use gpucompute::GpuCell;
+
 use js_sys::Date;
 
 use crate::spawn_sim_worker;
@@ -196,7 +198,7 @@ impl From<&ConfigurableParameters> for SimulationParameters {
             tree_growth_rate,
             tree_death_rate,
             underbrush_tree_growth_hindrance: config.underbrush_tree_growth_hindrance,
-            tree_underbrush_generation: config.tree_underbrush_generation,
+            tree_underbrush_generation: config.tree_underbrush_generation / ticks_per_year,
             tree_death_underbrush: config.tree_death_underbrush,
             tree_fire_duration: config.tree_fire_duration,
             underbrush_fire_duration: config.underbrush_fire_duration,
@@ -216,7 +218,7 @@ pub struct SimulationStatistics {
 
 #[wasm_bindgen]
 #[derive(Clone)]
-pub struct Simulation {
+pub struct SimulationHandle {
     parameters_tx: WatchSender<ConfigurableParameters>,
     parameters_rx: WatchReceiver<ConfigurableParameters>,
     stop: Arc<AtomicBool>,
@@ -228,7 +230,7 @@ pub struct Simulation {
 pub fn spawn_simulation(
     start_frame: SimulationFrame,
     parameters: ConfigurableParameters,
-) -> Simulation {
+) -> SimulationHandle {
     let (parameters_tx, parameters_rx) = watch::channel(parameters);
     let stop = Arc::new(AtomicBool::new(false));
     let wants_new_frame = Arc::new(AtomicBool::new(false));
@@ -248,7 +250,7 @@ pub fn spawn_simulation(
     })
     .unwrap();
     let stats_rx = Arc::new(Mutex::new(stats_rx));
-    Simulation {
+    SimulationHandle {
         parameters_tx,
         parameters_rx,
         stop,
@@ -258,7 +260,7 @@ pub fn spawn_simulation(
     }
 }
 
-impl Simulation {
+impl SimulationHandle {
     /// Get the latest completed simulation frame.
     pub fn get_latest_frame(&mut self) -> SimulationFrame {
         self.wants_new_frame.store(true, Ordering::Relaxed);
@@ -267,11 +269,11 @@ impl Simulation {
 }
 
 #[wasm_bindgen]
-impl Simulation {
+impl SimulationHandle {
     #[wasm_bindgen]
     pub async fn stop(self) -> Option<SimulationStatistics> {
         self.stop.store(true, Ordering::Relaxed);
-        crate::log("stopping");
+        log::info!("stopping");
         self.stats_rx
             .lock()
             .expect("failed to get stats rx lock")
@@ -308,15 +310,52 @@ pub async fn sim_thread(
         latest_frame_tx,
     )
     .unwrap();
+
+    // Debug logging state
+    let mut last_log_time = Date::now();
+    let mut ticks_since_last_log = 0u32;
+    let mut last_logged_params = Some(SimulationParameters::from(&parameters_rx.get()));
+
     while !stop.load(Ordering::Relaxed) {
         let config_params = parameters_rx.get();
         let parameters = SimulationParameters::from(&config_params);
+
+        // Log when parameters change
+        if last_logged_params.as_ref() != Some(&parameters) {
+            log::info!(
+                "Parameters changed: tick_rate={} ticks/sec, tree_growth={:.2e}/tick, tree_death={:.2e}/tick",
+                parameters.tick_rate,
+                parameters.tree_growth_rate,
+                parameters.tree_death_rate
+            );
+            last_logged_params = Some(parameters);
+        }
+
         context.compute_step(parameters);
         total_time += Date::now() - end_of_last_step;
         if wants_new_frame.load(Ordering::Relaxed) {
             context.send_latest();
         }
         total_iterations += 1;
+        ticks_since_last_log += 1;
+
+        // Log actual tick rate every 2 seconds
+        let now = Date::now();
+        let elapsed_since_log = now - last_log_time;
+        if elapsed_since_log >= 2000.0 && ticks_since_last_log > 0 {
+            let elapsed_sec = elapsed_since_log / 1000.0;
+            let actual_tick_rate = ticks_since_last_log as f64 / elapsed_sec;
+            log::info!(
+                "Actual tick rate: {:.1} ticks/sec (target: {} ticks/sec), {} ticks in {:.1}s",
+                actual_tick_rate,
+                parameters.tick_rate,
+                ticks_since_last_log,
+                elapsed_sec
+            );
+            last_log_time = now;
+            ticks_since_last_log = 0;
+        }
+
         if parameters.tick_rate == 0 {
             parameters_rx.wait();
             end_of_last_step = Date::now();

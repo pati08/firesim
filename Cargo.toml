@@ -10,21 +10,31 @@ debug = true
 crate-type = ["cdylib"]
 
 [dependencies]
-arc-swap = "1.7.1"
-fastrand = "2.3.0"
-rayon = "1.11.0"
 js-sys = "0.3.83"
 wasm-bindgen = "0.2.106"
-web-sys = { version = "0.3.83", features = ["CanvasRenderingContext2d", "Document", "Element", "HtmlCanvasElement", "ImageBitmap", "ImageData", "Window"] }
+web-sys = { version = "0.3.83", features = [
+    "CanvasRenderingContext2d",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "ImageBitmap",
+    "ImageData",
+    "Window",
+    "DedicatedWorkerGlobalScope",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+] }
 wasm-bindgen-futures = "0.4.56"
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 console_error_panic_hook = "0.1.7"
-wasm_thread = { version = "0.3.3" }
 watch = "0.2.3"
 bytemuck = { version = "1.22.0", features = ["derive"] }
-env_logger = "0.11"
-pollster = "0.4"
 wgpu = "27.0.0"
 anyhow = "1.0.100"
 futures-intrusive = "0.5.0"
-wasm-rs-async-executor = "0.9.0"
+winit = { version = "0.30.12", features = ["rwh_06"] }
+console_log = "1.0.0"
+fern = "0.7.1"
+humantime = "2.3.0"
+log = "0.4.29"
