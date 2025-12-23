@@ -314,7 +314,7 @@ pub async fn sim_thread(
     // Debug logging state
     let mut last_log_time = Date::now();
     let mut ticks_since_last_log = 0u32;
-    let mut last_logged_params: Option<SimulationParameters> = None;
+    let mut last_logged_params = Some(SimulationParameters::from(&parameters_rx.get()));
 
     while !stop.load(Ordering::Relaxed) {
         let config_params = parameters_rx.get();
