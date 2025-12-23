@@ -18,11 +18,98 @@ use crate::sim::{BurnState, CellState, SimulationFrame, SimulationParameters};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct GpuCell {
-    tree: f32,
-    underbrush: f32,
-    burning: u32,
-    padding: u32,
+pub struct GpuCell {
+    pub tree: f32,
+    pub underbrush: f32,
+    pub burning: u32,
+    pub padding: u32,
+}
+
+/// Shared GPU resources (device, queue, instance)
+pub struct GpuResources {
+    pub instance: Instance,
+    pub adapter: Adapter,
+    pub device: Arc<Device>,
+    pub queue: Arc<Queue>,
+}
+
+impl GpuResources {
+    pub async fn new() -> Result<Self, anyhow::Error> {
+        let instance = Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await?;
+
+        let downlevel_caps = adapter.get_downlevel_capabilities();
+        if !downlevel_caps
+            .flags
+            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        {
+            return Err(anyhow::anyhow!("adapter does not support compute shaders"));
+        }
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("firesim device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+            })
+            .await?;
+
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+        })
+    }
+
+    /// Create GPU resources with a compatible surface for rendering
+    pub async fn new_with_surface(
+        surface: &wgpu::Surface<'_>,
+    ) -> Result<Self, anyhow::Error> {
+        let instance = Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: Some(surface),
+            })
+            .await?;
+
+        let downlevel_caps = adapter.get_downlevel_capabilities();
+        if !downlevel_caps
+            .flags
+            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        {
+            return Err(anyhow::anyhow!("adapter does not support compute shaders"));
+        }
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("firesim device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+            })
+            .await?;
+
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+        })
+    }
 }
 
 pub struct ComputeContext {
@@ -37,9 +124,9 @@ pub struct ComputeContext {
     time_bind_group: BindGroup,
     time_buf: Buffer,
     old_params: SimulationParameters,
-    queue: Queue,
+    queue: Arc<Queue>,
     pipeline: ComputePipeline,
-    device: Device,
+    device: Arc<Device>,
     width: usize,
     height: usize,
     staging_buf: Buffer,
@@ -47,6 +134,7 @@ pub struct ComputeContext {
     steps: Arc<AtomicU32>,
     frame_tx: WatchSender<SimulationFrame>,
 }
+
 async fn get_adapter() -> Result<Adapter, anyhow::Error> {
     let instance = Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = instance
@@ -58,6 +146,7 @@ async fn get_adapter() -> Result<Adapter, anyhow::Error> {
         .await?;
     Ok(adapter)
 }
+
 pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
     let adapter = get_adapter().await?;
     let downlevel_caps = adapter.get_downlevel_capabilities();
@@ -79,7 +168,52 @@ pub async fn create_device() -> Result<(Device, Queue), anyhow::Error> {
         .await?;
     Ok(device)
 }
+
 impl ComputeContext {
+    /// Get the current output buffer (the one that was last written to)
+    /// This is the buffer that should be used for rendering
+    pub fn current_output_buffer(&self) -> &Buffer {
+        if self.flipped_bufs {
+            &self.buf_1
+        } else {
+            &self.buf_2
+        }
+    }
+
+    /// Get the current input buffer
+    pub fn current_input_buffer(&self) -> &Buffer {
+        if self.flipped_bufs {
+            &self.buf_2
+        } else {
+            &self.buf_1
+        }
+    }
+
+    /// Get both buffers for creating render bind groups
+    pub fn get_buffers(&self) -> (&Buffer, &Buffer) {
+        (&self.buf_1, &self.buf_2)
+    }
+
+    /// Returns true if buffers are flipped (buf_2 is input, buf_1 is output)
+    pub fn is_flipped(&self) -> bool {
+        self.flipped_bufs
+    }
+
+    /// Get grid dimensions
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// Get shared device reference
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    /// Get shared queue reference
+    pub fn queue(&self) -> &Arc<Queue> {
+        &self.queue
+    }
+
     pub fn compute_step(&mut self, parameters: SimulationParameters) {
         if parameters != self.old_params {
             self.update_params(parameters);
@@ -129,14 +263,42 @@ impl ComputeContext {
         self.flipped_bufs = !self.flipped_bufs;
         self.steps.fetch_add(1, Ordering::Relaxed);
     }
+
     fn update_params(&mut self, new: SimulationParameters) {
         self.old_params = new;
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&new));
     }
+
+    /// Create a compute context using shared GPU resources
+    pub fn create_with_resources(
+        resources: &GpuResources,
+        start: SimulationFrame,
+        parameters: SimulationParameters,
+        frame_tx: WatchSender<SimulationFrame>,
+    ) -> Result<Self, anyhow::Error> {
+        Self::create_internal(
+            Arc::clone(&resources.device),
+            Arc::clone(&resources.queue),
+            start,
+            parameters,
+            frame_tx,
+        )
+    }
+
     pub fn create(
         device: Device,
         queue: Queue,
+        start: SimulationFrame,
+        parameters: SimulationParameters,
+        frame_tx: WatchSender<SimulationFrame>,
+    ) -> Result<Self, anyhow::Error> {
+        Self::create_internal(Arc::new(device), Arc::new(queue), start, parameters, frame_tx)
+    }
+
+    fn create_internal(
+        device: Arc<Device>,
+        queue: Arc<Queue>,
         start: SimulationFrame,
         parameters: SimulationParameters,
         frame_tx: WatchSender<SimulationFrame>,
@@ -159,31 +321,27 @@ impl ComputeContext {
             label: Some("simulation compute shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("./shader.wgsl").into()),
         });
-        // Create a buffer with the data we want to process on the GPU.
-        //
-        // `create_buffer_init` is a utility provided by `wgpu::util::DeviceExt` which simplifies creating
-        // a buffer with some initial data.
-        //
-        // We use the `bytemuck` crate to cast the slice of f32 to a &[u8] to be uploaded to the GPU.
+
+        // Create buffers with STORAGE usage for compute and rendering
         let buf_1 = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("cells buffer 1"),
             contents: bytemuck::cast_slice(&start_data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         });
 
-        // Now we create a buffer to store the output data.
         let buf_2 = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cells buffer 2"),
             size: buf_1.size(),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let params_buf = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("simulation parameters buffer"),
             contents: bytemuck::bytes_of(&parameters),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
+
         let cells_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("cells bind group layout"),
             entries: &[
@@ -209,6 +367,7 @@ impl ComputeContext {
                 },
             ],
         });
+
         let cells_bg = device.create_bind_group(&BindGroupDescriptor {
             label: Some("cells bind group (buf1 -> buf2)"),
             layout: &cells_bg_layout,
@@ -223,6 +382,7 @@ impl ComputeContext {
                 },
             ],
         });
+
         let cells_bg_rev = device.create_bind_group(&BindGroupDescriptor {
             label: Some("cells bind group (buf2 -> buf1)"),
             layout: &cells_bg_layout,
@@ -237,6 +397,7 @@ impl ComputeContext {
                 },
             ],
         });
+
         let params_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("parameters bind group layout"),
             entries: &[BindGroupLayoutEntry {
@@ -250,6 +411,7 @@ impl ComputeContext {
                 count: None,
             }],
         });
+
         let params_bg = device.create_bind_group(&BindGroupDescriptor {
             label: Some("parameters bind group"),
             layout: &params_bg_layout,
@@ -258,11 +420,13 @@ impl ComputeContext {
                 resource: params_buf.as_entire_binding(),
             }],
         });
+
         let time_buf = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("time buffer"),
             contents: &[0, 0, 0, 0],
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
+
         let time_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("time bind group layout"),
             entries: &[BindGroupLayoutEntry {
@@ -276,6 +440,7 @@ impl ComputeContext {
                 count: None,
             }],
         });
+
         let time_bg = device.create_bind_group(&BindGroupDescriptor {
             label: Some("time bind group"),
             layout: &time_bg_layout,
@@ -284,6 +449,7 @@ impl ComputeContext {
                 resource: time_buf.as_entire_binding(),
             }],
         });
+
         let size_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("grid size bind group layout"),
             entries: &[BindGroupLayoutEntry {
@@ -297,11 +463,13 @@ impl ComputeContext {
                 count: None,
             }],
         });
+
         let size_buf = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("grid size buffer"),
             contents: bytemuck::cast_slice(&[start.width as u32, start.height as u32]),
             usage: BufferUsages::UNIFORM,
         });
+
         let size_bg = device.create_bind_group(&BindGroupDescriptor {
             label: Some("grid size bind group"),
             layout: &size_bg_layout,
@@ -310,6 +478,7 @@ impl ComputeContext {
                 resource: size_buf.as_entire_binding(),
             }],
         });
+
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("simulation pipeline layout"),
             bind_group_layouts: &[
@@ -320,6 +489,7 @@ impl ComputeContext {
             ],
             push_constant_ranges: &[],
         });
+
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("simulation compute pipeline"),
             layout: Some(&pipeline_layout),
@@ -328,12 +498,14 @@ impl ComputeContext {
             compilation_options: PipelineCompilationOptions::default(),
             cache: None,
         });
+
         let staging_buf = device.create_buffer(&BufferDescriptor {
             label: Some("staging buffer"),
             size: buf_1.size(),
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
         Ok(Self {
             buf_1,
             buf_2,
@@ -357,6 +529,7 @@ impl ComputeContext {
             frame_tx,
         })
     }
+
     pub fn send_latest(&self) {
         if !self
             .staging_mapped

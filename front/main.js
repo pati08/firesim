@@ -1,29 +1,10 @@
-// Use ES module import syntax to import functionality from the module
-// that we have compiled.
-  //
-  // Note that the `default` import is an initialization function which
-// will "boot" the module and make it ready to use. Currently browsers
-// don't support natively imported WebAssembly as an ES module, but
-// eventually the manual initialization won't be required!
-import init, { initialize, start } from './pkg/firesim.js';
+// Fire Simulation with GPU Rendering
+// Uses WebGPU for both compute simulation and rendering
 
-var sim = null;
-var currentParams = null;
-var paused = false;
-var paramSettings;
-var originalMonthsPerSecond = null;
+import init, { initialize, start, SimulationController } from './pkg/firesim.js';
 
-function setParameters(params) {
-  sim.set_parameters(params);
-  currentParams = sim.get_parameters();
-}
-
-function updateParams(f) {
-  f(currentParams);
-  sim.set_parameters(currentParams);
-  currentParams = sim.get_parameters();
-  updateStaticParamsDisplay();
-}
+let isPaused = false;
+let isStopped = false;
 
 function resizeCanvas(canvas) {
   const dpr = window.devicePixelRatio || 1;
@@ -35,206 +16,236 @@ function resizeCanvas(canvas) {
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width  = width;
     canvas.height = height;
+    // Note: Don't get a 2D context here - WebGPU will handle rendering
+  }
+}
 
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+// Parameter definitions with metadata
+const PARAMETERS = {
+  months_per_second: {
+    label: "Simulation Speed (months/sec)",
+    min: 1,
+    max: 1000,
+    step: 1,
+    default: 36,
+    setter: (v) => SimulationController.set_months_per_second(v)
+  },
+  ticks_per_month: {
+    label: "Resolution (ticks/month)",
+    min: 1,
+    max: 20,
+    step: 1,
+    default: 2,
+    setter: (v) => SimulationController.set_ticks_per_month(v)
+  },
+  lightning_frequency: {
+    label: "Lightning (strikes/year/acre)",
+    min: 0,
+    max: 0.1,
+    step: 0.001,
+    default: 1/45,
+    setter: (v) => SimulationController.set_lightning_frequency(v)
+  },
+  fire_spread_rate: {
+    label: "Fire Spread Rate",
+    min: 0,
+    max: 1,
+    step: 0.05,
+    default: 1.0,
+    setter: (v) => SimulationController.set_fire_spread_rate(v)
+  },
+  tree_growth_years: {
+    label: "Tree Growth (years)",
+    min: 10,
+    max: 500,
+    step: 10,
+    default: 150,
+    setter: (v) => SimulationController.set_tree_growth_years(v)
+  },
+  tree_death_years: {
+    label: "Tree Death (years)",
+    min: 50,
+    max: 500,
+    step: 10,
+    default: 200,
+    setter: (v) => SimulationController.set_tree_death_years(v)
+  },
+  tree_flammability: {
+    label: "Tree Flammability",
+    min: 0,
+    max: 1,
+    step: 0.05,
+    default: 0.5,
+    setter: (v) => SimulationController.set_tree_flammability(v)
+  },
+  underbrush_flammability: {
+    label: "Underbrush Flammability",
+    min: 0,
+    max: 2,
+    step: 0.1,
+    default: 1.0,
+    setter: (v) => SimulationController.set_underbrush_flammability(v)
+  },
+  tree_underbrush_generation: {
+    label: "Underbrush Generation",
+    min: 0,
+    max: 0.001,
+    step: 0.00001,
+    default: 0.0001,
+    setter: (v) => SimulationController.set_tree_underbrush_generation(v)
+  },
+  underbrush_tree_growth_hindrance: {
+    label: "Underbrush Growth Hindrance",
+    min: 0,
+    max: 1,
+    step: 0.1,
+    default: 0,
+    setter: (v) => SimulationController.set_underbrush_tree_growth_hindrance(v)
+  },
+  tree_fire_duration: {
+    label: "Tree Fire Duration (ticks)",
+    min: 1,
+    max: 10,
+    step: 1,
+    default: 1,
+    setter: (v) => SimulationController.set_tree_fire_duration(v)
+  },
+  underbrush_fire_duration: {
+    label: "Underbrush Fire Duration (ticks)",
+    min: 1,
+    max: 10,
+    step: 1,
+    default: 1,
+    setter: (v) => SimulationController.set_underbrush_fire_duration(v)
+  }
+};
+
+function formatValue(value, step) {
+  if (step >= 1) return Math.round(value).toString();
+  const decimals = Math.max(0, -Math.floor(Math.log10(step)));
+  return value.toFixed(decimals);
+}
+
+function createParameterControl(key, param) {
+  const container = document.createElement('div');
+  container.className = 'param-control';
+  
+  const label = document.createElement('label');
+  label.textContent = param.label;
+  label.htmlFor = `param-${key}`;
+  
+  const inputContainer = document.createElement('div');
+  inputContainer.className = 'input-container';
+  
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.id = `param-${key}`;
+  input.min = param.min;
+  input.max = param.max;
+  input.step = param.step;
+  input.value = param.default;
+  
+  const valueDisplay = document.createElement('span');
+  valueDisplay.className = 'value-display';
+  valueDisplay.textContent = formatValue(param.default, param.step);
+  
+  input.addEventListener('input', (e) => {
+    const value = parseFloat(e.target.value);
+    valueDisplay.textContent = formatValue(value, param.step);
+    param.setter(value);
+  });
+  
+  inputContainer.appendChild(input);
+  inputContainer.appendChild(valueDisplay);
+  
+  container.appendChild(label);
+  container.appendChild(inputContainer);
+  
+  return container;
+}
+
+function initParametersPanel() {
+  const panel = document.getElementById('mutable-params');
+  if (!panel) return;
+  
+  panel.style.display = 'block';
+  
+  // Clear existing content except the header
+  const header = panel.querySelector('h1');
+  panel.innerHTML = '';
+  if (header) panel.appendChild(header);
+  
+  // Add parameter controls
+  for (const [key, param] of Object.entries(PARAMETERS)) {
+    panel.appendChild(createParameterControl(key, param));
+  }
+}
+
+function updatePauseButton() {
+  const pauseButton = document.getElementById('pauseButton');
+  if (pauseButton) {
+    if (isStopped) {
+      pauseButton.textContent = 'Resume simulation';
+    } else {
+      pauseButton.textContent = isPaused ? 'Resume simulation' : 'Pause simulation';
+    }
+  }
+}
+
+function updateStopButton() {
+  const stopButton = document.getElementById('stopButton');
+  if (stopButton) {
+    stopButton.textContent = isStopped ? 'Simulation stopped' : 'Stop simulation';
+    stopButton.disabled = isStopped;
   }
 }
 
 async function run() {
   await init();
-  // await initThreadPool(navigator.hardwareConcurrency);
   await initialize();
+  
   let canvas = document.getElementById("sim-surface");
   resizeCanvas(canvas);
-  canvas.addEventListener("resize", () => resizeCanvas(canvas));
-  sim = await start();
-  globalThis.sim = sim;
-  currentParams = sim.get_parameters();
-  originalMonthsPerSecond = currentParams.months_per_second;
-  initParamsPanel();
+  
+  // Initialize the parameters panel
+  initParametersPanel();
+  
+  // Start the GPU-based simulation with integrated rendering
+  // The start() function uses winit event loop and handles everything internally
+  start();
+  
+  console.log("Fire simulation started with GPU rendering");
 }
 
 run();
 
-async function stopButtonClicked() {
-  let stats = await sim.stop();
-  let stats_text = "Average time per step: " + stats.average_step_exec_time.toPrecision(2) + "ms";
-  let stats_panel = document.getElementById("stats");
-  stats_panel.style.display = "block";
-  let end = document.createElement("p");
-  end.innerText = stats_text;
-  stats_panel.appendChild(end);
-}
-
-document.getElementById("stopButton").addEventListener("click", stopButtonClicked);
-
-function togglePaused() {
-  updateParams(params => {
-    if (paused) {
-      paused = false;
-      // Restore original months_per_second to resume
-      params.months_per_second = originalMonthsPerSecond;
-    } else {
-      paused = true;
-      // Set months_per_second to 0 to pause (tick_rate will be 0)
-      params.months_per_second = 0;
-    }
-  })
-}
-
-function initParamsPanel() {
-  let static_panel = document.getElementById("static-params");
-  let mutable_panel = document.getElementById("mutable-params");
-  let p = currentParams;
-  
-  // Static parameters (read-only)
-  const staticParams = [
-    'forest_width',
-    'forest_height',
-    'forest_acres',
-  ];
-  
-  // Mutable parameters (editable)
-  const mutableParams = [
-    'months_per_second',
-    'lightning_strikes_per_year_per_acre',
-    'tree_growth_years',
-    'tree_death_years',
-    'underbrush_tree_growth_hindrance',
-    'tree_underbrush_generation',
-    'tree_death_underbrush',
-    'tree_fire_duration',
-    'underbrush_fire_duration',
-    'fire_spread_rate',
-    'tree_flammability',
-    'underbrush_flammability',
-    'ticks_per_month'
-  ];
-  
-  // Create static parameters panel (read-only values)
-  staticParams.forEach(paramName => {
-    let label = document.createElement("p");
-    label.innerText = formatParamName(paramName) + ": ";
-    let value = document.createElement("span");
-    value.style.fontWeight = "bold";
-    value.style.marginLeft = "8px";
-    value.id = `static-${paramName}`;
-    value.innerText = formatParamValue(p[paramName], paramName);
-    let newl = document.createElement("br");
-    static_panel.appendChild(label);
-    static_panel.appendChild(value);
-    static_panel.appendChild(newl);
-  });
-  static_panel.style.display = "block";
-  
-  // Create mutable parameters panel (editable inputs)
-  mutableParams.forEach(paramName => {
-    let label = document.createElement("p");
-    label.innerText = formatParamName(paramName) + ": ";
-    let input = document.createElement("input");
-    input.type = "number";
-    input.step = getStepForParam(paramName);
-    input.value = typeof p[paramName] === 'number' ? p[paramName].toFixed(2) : p[paramName];
-    input.id = `mutable-${paramName}`;
-    let newl = document.createElement("br");
-    mutable_panel.appendChild(label);
-    mutable_panel.appendChild(input);
-    mutable_panel.appendChild(newl);
-    input.addEventListener("input", () => {
-      updateParams(params => {
-        const numValue = parseFloat(input.value);
-        if (!isNaN(numValue)) {
-          params[paramName] = numValue; // Update without rounding while editing
-        }
-      });
-      // Update static params display in case they depend on mutable params
-      updateStaticParamsDisplay();
-    });
-    input.addEventListener("blur", () => {
-      // Round and constrain value when done editing
-      const numValue = parseFloat(input.value);
-      if (!isNaN(numValue)) {
-        const roundedValue = Math.round(numValue * 100) / 100; // Round to 2 decimal places
-        updateParams(params => {
-          params[paramName] = roundedValue;
-        });
-        input.value = roundedValue.toFixed(2); // Update display to show rounded value
-        // Update static params display in case they depend on mutable params
-        updateStaticParamsDisplay();
-        // If months_per_second changed and we're not paused, update original value
-        if (paramName === 'months_per_second' && !paused) {
-          originalMonthsPerSecond = roundedValue;
-        }
-      }
-    });
-  });
-  mutable_panel.style.display = "block";
-  
-  // Store param settings for reference
-  paramSettings = [...staticParams, ...mutableParams].map(prop => ({
-    name: prop,
-    value: p[prop],
-  }));
-}
-
-function formatParamName(name) {
-  return name
-    .split('_')
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ');
-}
-
-function formatParamValue(value, paramName) {
-  if (paramName === 'forest_acres') {
-    return value.toFixed(2) + ' acres';
+// Stop button handler
+document.getElementById("stopButton").addEventListener("click", () => {
+  if (!isStopped) {
+    SimulationController.stop();
+    isStopped = true;
+    isPaused = false;
+    updateStopButton();
+    updatePauseButton();
+    console.log("Simulation stopped");
   }
-  if (paramName === 'months_per_second') {
-    return value.toFixed(2) + ' months/sec';
-  }
-  if (paramName === 'ticks_per_month') {
-    return value.toFixed(1) + ' ticks/month';
-  }
-  if (paramName.includes('years')) {
-    return value.toFixed(1) + ' years';
-  }
-  if (paramName.includes('per_year_per_acre')) {
-    return value.toFixed(4) + ' strikes/year/acre';
-  }
-  if (typeof value === 'number') {
-    if (Number.isInteger(value)) {
-      return value.toString();
-    }
-    return value.toFixed(4);
-  }
-  return value.toString();
-}
+});
 
-function getStepForParam(paramName) {
-  if (paramName.includes('years') || paramName.includes('per_year')) {
-    return '0.1';
+// Pause button handler
+document.getElementById("pauseButton").addEventListener("click", () => {
+  if (isStopped) {
+    // Resume from stopped state
+    SimulationController.resume();
+    isStopped = false;
+    isPaused = false;
+    updateStopButton();
+    updatePauseButton();
+    console.log("Simulation resumed from stop");
+  } else {
+    // Toggle pause
+    SimulationController.toggle_pause();
+    isPaused = !isPaused;
+    updatePauseButton();
+    console.log(isPaused ? "Simulation paused" : "Simulation resumed");
   }
-  if (paramName.includes('duration')) {
-    return '1';
-  }
-  return '0.0001';
-}
-
-function updateStaticParamsDisplay() {
-  if (!currentParams) return;
-  const staticParams = [
-    'forest_width',
-    'forest_height',
-    'forest_acres',
-    'ticks_per_month'
-  ];
-  
-  staticParams.forEach(paramName => {
-    const element = document.getElementById(`static-${paramName}`);
-    if (element) {
-      element.innerText = formatParamValue(currentParams[paramName], paramName);
-    }
-  });
-}
-
-document.getElementById("pauseButton").addEventListener("click", togglePaused);
+});

@@ -77,17 +77,85 @@ button:hover {
   color: #333;
 }
 
-#mutable-params input {
-  display: inline;
-  margin-left: 8px;
-  padding: 4px;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  width: 120px;
+/* Parameter controls styling */
+.param-control {
+  margin-bottom: 12px;
 }
 
-#mutable-params input:focus {
+.param-control label {
+  display: block;
+  font-size: 0.85rem;
+  color: #555;
+  margin-bottom: 4px;
+}
+
+.param-control .input-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.param-control input[type="range"] {
+  flex: 1;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: #ddd;
+  border-radius: 3px;
   outline: none;
-  border-color: #4a90e2;
-  box-shadow: 0 0 0 2px rgba(74, 144, 226, 0.2);
+}
+
+.param-control input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #4a90e2;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.param-control input[type="range"]::-webkit-slider-thumb:hover {
+  background: #357abd;
+}
+
+.param-control input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #4a90e2;
+  cursor: pointer;
+  border: none;
+  transition: background 0.15s;
+}
+
+.param-control input[type="range"]::-moz-range-thumb:hover {
+  background: #357abd;
+}
+
+.param-control .value-display {
+  min-width: 50px;
+  text-align: right;
+  font-size: 0.85rem;
+  color: #333;
+  font-family: monospace;
+}
+
+#mutable-params {
+  min-width: 280px;
+}
+
+#pauseButton {
+  background-color: #4a90e2;
+  color: white;
+}
+
+#pauseButton:hover {
+  background-color: #357abd;
+}
+
+#stopButton:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
 }
