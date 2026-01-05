@@ -89,7 +89,7 @@ const PARAMETERS = {
   tree_underbrush_generation: {
     label: "Underbrush Generation",
     min: 0,
-    max: 0.001,
+    max: 0.01,
     step: 0.00001,
     default: 0.0001,
     setter: (v) => SimulationController.set_tree_underbrush_generation(v)
